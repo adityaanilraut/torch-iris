@@ -1,0 +1,22 @@
+{
+  "scope": "iris-portable-training",
+  "version": 1,
+  "reference": "PyTorch 2.12.1 CUDA on a physical NVIDIA GPU",
+  "dtype": "FP32, FP16 autocast, and integer targets",
+  "execution": "eager first-order autograd with SGD, Adam, and AdamW",
+  "tolerances": {"rtol": 0.0002, "atol": 0.00001},
+  "cases": [
+    {"id": "mlp_training", "operators": ["aten::linear", "aten::addmm", "aten::relu", "aten::threshold_backward", "aten::mse_loss", "aten::mse_loss_backward", "aten::mm", "aten::sum.dim_IntList", "aten::add_.Tensor", "aten::mul_.Tensor"], "behavior": "Four MLP steps comparing shape, dtype, stride, predictions, losses, input and parameter gradients, updated weights and momentum buffers"},
+    {"id": "training_host_transfer", "operators": ["aten::_to_copy", "aten::copy_", "aten::mse_loss_backward"], "behavior": "Four MLP steps with host activation upload and loss download in the autograd graph, plus activation gradients on the host and device"},
+    {"id": "mse_reductions", "operators": ["aten::mse_loss", "aten::mse_loss_backward"], "behavior": "Unreduced, sum, mean and empty-mean MSE through nn.MSELoss and autograd"},
+    {"id": "adam_training", "operators": ["aten::lerp_.Scalar", "aten::addcmul_", "aten::addcdiv_", "aten::sqrt", "aten::maximum.out"], "behavior": "Three Adam and AdamW steps with AMSGrad, weight decay and both foreach settings, including loss, parameters and optimizer state"},
+    {"id": "embedding_cross_entropy", "operators": ["aten::embedding", "aten::embedding_dense_backward", "aten::cross_entropy_loss", "aten::nll_loss_forward", "aten::nll_loss_backward", "aten::_log_softmax", "aten::_log_softmax_backward_data"], "behavior": "Embedding and weighted cross-entropy forward/backward with padding, repeated indices, ignore_index and all reductions"},
+    {"id": "cnn_training", "operators": ["aten::convolution_overrideable", "aten::convolution_backward_overrideable", "aten::max_pool2d_with_indices", "aten::max_pool2d_with_indices_backward", "aten::linear", "aten::cross_entropy_loss"], "behavior": "CNN prediction, cross-entropy loss, gradients and parameter updates after one SGD step"},
+    {"id": "transformer_training", "operators": ["aten::embedding", "aten::native_layer_norm", "aten::native_layer_norm_backward", "aten::scaled_dot_product_attention", "aten::linear", "aten::gelu", "aten::cross_entropy_loss"], "behavior": "Transformer prediction, cross-entropy loss, gradients and parameter updates after one SGD step"},
+    {"id": "autocast_training", "operators": ["aten::linear", "aten::addmm", "aten::mm", "aten::mse_loss"], "behavior": "FP16 autocast predictions with FP32 loss, backward gradients and a parameter update"},
+    {"id": "resnet_block_training", "operators": ["aten::convolution_overrideable", "aten::native_batch_norm", "aten::native_batch_norm_backward", "aten::_adaptive_avg_pool2d", "aten::_adaptive_avg_pool2d_backward", "aten::linear", "aten::cross_entropy_loss", "aten::_fused_sgd_", "aten::_fused_adamw_"], "behavior": "ResNet residual block with BatchNorm2d, AdaptiveAvgPool2d, Linear, CrossEntropyLoss, and fused SGD/AdamW training steps"},
+    {"id": "llama_block_training_and_generation", "operators": ["aten::embedding", "aten::rms_norm", "aten::sin", "aten::cos", "aten::scaled_dot_product_attention", "aten::silu", "aten::topk", "aten::argmax", "aten::_fused_adamw_"], "behavior": "Llama-style Transformer block with RoPE sin/cos, RMSNorm, SDPA head_dim=64, SwiGLU MLP, fused AdamW training step, and autoregressive top-k/argmax token generation"},
+    {"id": "flash_sdpa_backward_and_kv_decode", "operators": ["aten::scaled_dot_product_attention", "aten::rms_norm", "aten::linear", "aten::cat", "aten::_fused_adamw_"], "behavior": "Fused FlashAttention forward+backward (causal, non-causal, GQA, d=64 and d=128) plus KV-cached autoregressive decode parity"},
+    {"id": "unet_modern_vision_training", "operators": ["aten::convolution_overrideable", "aten::native_group_norm", "aten::mish", "aten::leaky_relu", "aten::hardtanh_", "aten::reflection_pad2d", "aten::upsample_bilinear2d", "aten::grid_sampler_2d"], "behavior": "Modern UNet/Vision training step exercising GroupNorm, Mish, LeakyReLU, ReLU6/hardtanh_, reflection padding, ConvTranspose2d, bilinear upsampling, and grid_sampler_2d backward"}
+  ]
+}

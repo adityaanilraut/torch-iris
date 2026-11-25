@@ -1,0 +1,30 @@
+torch-iris
+Copyright 2026 Aditya Anil Raut
+
+This product includes software developed by Aditya Anil Raut
+(https://github.com/adityaanilraut/torch-iris).
+
+===============================================================================
+Third-Party Components
+===============================================================================
+
+1. Khronos OpenCL C Headers (third_party/opencl/CL/)
+   Files: cl.h, cl_platform.h, cl_version.h
+   Copyright (c) 2008-2020 The Khronos Group Inc.
+   Licensed under the Apache License, Version 2.0.
+   See third_party/opencl/LICENSE for the full license text.
+
+===============================================================================
+Trademark & Non-Affiliation Notices
+===============================================================================
+
+torch-iris is an independent open-source project and is not affiliated with,
+endorsed by, or sponsored by Intel Corporation, Meta Platforms, Inc., the
+PyTorch Foundation, The Linux Foundation, The Khronos Group Inc., or Microsoft
+Corporation.
+
+- PyTorch is a trademark of The Linux Foundation.
+- Intel and Intel Iris Xe are trademarks of Intel Corporation or its subsidiaries.
+- OpenCL and the OpenCL logo are trademarks of Apple Inc. used by permission
+  by Khronos.
+- Microsoft, Windows, and DirectML are trademarks of Microsoft Corporation.

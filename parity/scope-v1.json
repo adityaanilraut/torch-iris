@@ -1,0 +1,35 @@
+{
+  "scope": "iris-portable-fp32-mlp-forward",
+  "version": 1,
+  "reference": "PyTorch 2.12.1 CUDA on a physical NVIDIA GPU",
+  "dtype": "torch.float32",
+  "execution": "eager, torch.no_grad",
+  "tolerances": {"rtol": 0.0001, "atol": 0.00001},
+  "cases": [
+    {"id": "mlp_forward_2d", "operators": ["aten::linear", "aten::addmm", "aten::t", "aten::relu", "aten::sum"], "behavior": "Biased 2-D MLP, both linear outputs, ReLU output and scalar sum from shared inputs and parameters"},
+    {"id": "mlp_forward_3d", "operators": ["aten::linear", "aten::addmm", "aten::view", "aten::relu", "aten::sum"], "behavior": "Biased MLP over contiguous batch and sequence dimensions"},
+    {"id": "mlp_forward_empty_batch", "operators": ["aten::linear", "aten::addmm", "aten::relu", "aten::sum"], "behavior": "All outputs, including the scalar sum, for an empty batch"},
+    {"id": "linear_device_init", "operators": ["aten::empty.memory_format", "aten::uniform_"], "behavior": "Construct nn.Linear directly on device, check bounds, same-device seeded reproducibility and execution using the initialized weights", "comparison": "RNG invariants and forward using recorded weights"},
+    {"id": "view_alias", "operators": ["aten::view", "aten::reshape", "aten::_reshape_alias", "aten::t", "aten::transpose.int", "aten::as_strided", "aten::fill_.Scalar"], "behavior": "View shape, offset, stride, aliasing and mutation plus reshape copy of a transpose"},
+    {"id": "expanded_alias", "operators": ["aten::expand", "aten::fill_.Scalar"], "behavior": "Zero stride, shared mutation, and expanded-view readback"},
+    {"id": "strided_copy", "operators": ["aten::empty_strided", "aten::copy_", "aten::_to_copy"], "behavior": "CPU/device copy in both directions, device/device broadcast copy and strided destination mutation"},
+    {"id": "binary_broadcast", "operators": ["aten::add.Tensor", "aten::mul.Tensor"], "behavior": "Mixed ranks, zero-stride operands, noncontiguous inputs and an empty dimension"},
+    {"id": "initialization", "operators": ["aten::zeros", "aten::full", "aten::zero_", "aten::fill_.Scalar"], "behavior": "FP32 factories and in-place writes to contiguous and offset tensors"},
+    {"id": "mm_strided", "operators": ["aten::mm"], "behavior": "Both 2-D inputs are views with nontrivial strides and offsets"},
+    {"id": "addmm_scalars", "operators": ["aten::addmm"], "behavior": "Bias broadcasting, nondefault alpha and beta, beta zero with NaN input, and zero inner dimension"},
+    {"id": "reduce_sum", "operators": ["aten::sum", "aten::sum.dim_IntList"], "behavior": "Whole, dimensioned and keepdim sums over strided inputs, scalar and empty reductions"},
+    {"id": "nonfinite", "operators": ["aten::relu", "aten::sum"], "behavior": "ReLU and reduction semantics for NaN and infinity"},
+    {"id": "expected_errors", "operators": ["aten::view", "aten::add.Tensor", "aten::addmm", "aten::sum.dim_IntList", "aten::copy_"], "behavior": "Invalid view, broadcast, matrix shape and reduction dimensions, plus invalid overlap on writes"}
+  ],
+  "future_workflows": [
+    {"id": "mlp_training", "behavior": "Forward, gradients, SGD with momentum, parameter updates and loss using identical fixtures"},
+    {"id": "training_host_transfer", "behavior": "Host to device activation copy and device to host loss copy in an autograd graph"},
+    {"id": "index_reduce_batch_conv_norm_attention", "behavior": "Indexing, reductions, batched matmul, convolution, normalization, softmax and attention"},
+    {"id": "dtype_rng_serialization", "behavior": "Promotion, FP16, BF16, autocast, RNG state and serialization"},
+    {"id": "compile_stream_event_async_multi_device", "behavior": "torch.compile, streams, events, asynchronous copies and multiple devices"}
+  ],
+  "vendor_capabilities": [
+    {"id": "cuda_binary_loading", "behavior": "Load CUDA cubin/fatbin", "portable_equivalent": "A separately compiled backend implementation such as an OpenCL kernel"},
+    {"id": "ptx_execution", "behavior": "Load or JIT NVIDIA PTX", "portable_equivalent": "Port to OpenCL C or use a portable PyTorch operator implementation"}
+  ]
+}

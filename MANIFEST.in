@@ -1,0 +1,6 @@
+include LICENSE NOTICE README.md
+recursive-include csrc *.h *.cpp
+recursive-include examples *.py
+recursive-include third_party/opencl *.h LICENSE
+recursive-include parity *.py scope-*.json
+recursive-include tests *.py

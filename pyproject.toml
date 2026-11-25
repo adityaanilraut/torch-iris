@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch-iris"
+version = "0.16.0"
+description = "OpenCL PyTorch backend extension for Intel Iris Xe GPUs on 64-bit Windows"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "third_party/opencl/LICENSE"]
+authors = [
+    { name = "Aditya Anil Raut" },
+]
+requires-python = ">=3.12,<3.13"
+dependencies = ["torch==2.12.1"]
+keywords = ["pytorch", "intel", "iris-xe", "opencl", "gpu", "windows", "backend"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/adityaanilraut/torch-iris"
+Repository = "https://github.com/adityaanilraut/torch-iris"
+Issues = "https://github.com/adityaanilraut/torch-iris/issues"
