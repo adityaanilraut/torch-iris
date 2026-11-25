@@ -19,7 +19,16 @@
 
 ## Installation
 
-### Option 1: Install the prebuilt wheel (Recommended)
+### Option 1: Install from PyPI (Recommended)
+
+On **64-bit Windows with Python 3.12**, install directly via `pip` (this automatically installs `torch==2.12.1` alongside `torch-iris`):
+
+```powershell
+py -3.12 -m venv .venv-iris
+.\.venv-iris\Scripts\python.exe -m pip install torch-iris
+```
+
+### Option 2: Install the prebuilt wheel from GitHub Releases
 
 Download `torch_iris-0.16.0-cp312-cp312-win_amd64.whl` from the [GitHub Releases](https://github.com/adityaanilraut/torch-iris/releases/tag/v0.16.0) page, then run:
 
@@ -34,7 +43,7 @@ $iris = '.\.venv-iris\Scripts\python.exe'
 & $iris -m pip install --no-deps .\torch_iris-0.16.0-cp312-cp312-win_amd64.whl
 ```
 
-### Option 2: Build from source
+### Option 3: Build from source
 
 Requires **Visual Studio 2022 Build Tools** with the **Desktop development with C++** workload and a **Windows 10/11 SDK**. The repository bundles the Khronos OpenCL C headers (`third_party/opencl`) and loads the OpenCL runtime dynamically from your installed Intel graphics driver.
 
