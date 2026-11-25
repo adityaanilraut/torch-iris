@@ -9,6 +9,7 @@
 #include <ATen/native/Resize.h>
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
+#include <ATen/ops/native_batch_norm.h>
 #include <ATen/ops/zeros.h>
 #include <ATen/ops/zeros_like.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -1201,8 +1202,20 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("_fused_adamw_.tensor_lr", &fused_adam_tensor_lr<true>);
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t> batch_norm_impl_index_autograd(
+    const at::Tensor& input, const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias, const std::optional<at::Tensor>& running_mean,
+    const std::optional<at::Tensor>& running_var, bool training, double momentum, double eps,
+    bool /*cudnn_enabled*/) {
+    auto reserve = at::empty({0}, input.options().dtype(at::kByte));
+    auto [out, save_mean, save_invstd] = at::native_batch_norm(
+        input, weight, bias, running_mean, running_var, training, momentum, eps);
+    return {std::move(out), std::move(save_mean), std::move(save_invstd), std::move(reserve), 0};
+}
+
 TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
     m.impl("rms_norm", &rms_norm_autograd);
+    m.impl("_batch_norm_impl_index", &batch_norm_impl_index_autograd);
 }
 
 }  // namespace

@@ -428,6 +428,7 @@ struct MemoryStats {
     std::uint64_t reuses = 0;
     std::size_t peak_allocated_bytes = 0;
     std::size_t peak_reserved_bytes = 0;
+    std::uint64_t cache_reclaims = 0;
 };
 
 void empty_cache();

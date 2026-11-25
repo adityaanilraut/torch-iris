@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -68,8 +69,85 @@ const OpenCL& cl() {
     return api;
 }
 
+const char* cl_error_name(cl_int status) noexcept {
+    switch (status) {
+        case CL_SUCCESS: return "CL_SUCCESS";
+        case CL_DEVICE_NOT_FOUND: return "CL_DEVICE_NOT_FOUND";
+        case CL_DEVICE_NOT_AVAILABLE: return "CL_DEVICE_NOT_AVAILABLE";
+        case CL_COMPILER_NOT_AVAILABLE: return "CL_COMPILER_NOT_AVAILABLE";
+        case CL_MEM_OBJECT_ALLOCATION_FAILURE: return "CL_MEM_OBJECT_ALLOCATION_FAILURE";
+        case CL_OUT_OF_RESOURCES: return "CL_OUT_OF_RESOURCES";
+        case CL_OUT_OF_HOST_MEMORY: return "CL_OUT_OF_HOST_MEMORY";
+        case CL_PROFILING_INFO_NOT_AVAILABLE: return "CL_PROFILING_INFO_NOT_AVAILABLE";
+        case CL_MEM_COPY_OVERLAP: return "CL_MEM_COPY_OVERLAP";
+        case CL_IMAGE_FORMAT_MISMATCH: return "CL_IMAGE_FORMAT_MISMATCH";
+        case CL_IMAGE_FORMAT_NOT_SUPPORTED: return "CL_IMAGE_FORMAT_NOT_SUPPORTED";
+        case CL_BUILD_PROGRAM_FAILURE: return "CL_BUILD_PROGRAM_FAILURE";
+        case CL_MAP_FAILURE: return "CL_MAP_FAILURE";
+        case CL_INVALID_VALUE: return "CL_INVALID_VALUE";
+        case CL_INVALID_DEVICE_TYPE: return "CL_INVALID_DEVICE_TYPE";
+        case CL_INVALID_PLATFORM: return "CL_INVALID_PLATFORM";
+        case CL_INVALID_DEVICE: return "CL_INVALID_DEVICE";
+        case CL_INVALID_CONTEXT: return "CL_INVALID_CONTEXT";
+        case CL_INVALID_QUEUE_PROPERTIES: return "CL_INVALID_QUEUE_PROPERTIES";
+        case CL_INVALID_COMMAND_QUEUE: return "CL_INVALID_COMMAND_QUEUE";
+        case CL_INVALID_HOST_PTR: return "CL_INVALID_HOST_PTR";
+        case CL_INVALID_MEM_OBJECT: return "CL_INVALID_MEM_OBJECT";
+        case CL_INVALID_BUILD_OPTIONS: return "CL_INVALID_BUILD_OPTIONS";
+        case CL_INVALID_PROGRAM: return "CL_INVALID_PROGRAM";
+        case CL_INVALID_PROGRAM_EXECUTABLE: return "CL_INVALID_PROGRAM_EXECUTABLE";
+        case CL_INVALID_KERNEL_NAME: return "CL_INVALID_KERNEL_NAME";
+        case CL_INVALID_KERNEL_DEFINITION: return "CL_INVALID_KERNEL_DEFINITION";
+        case CL_INVALID_KERNEL: return "CL_INVALID_KERNEL";
+        case CL_INVALID_ARG_INDEX: return "CL_INVALID_ARG_INDEX";
+        case CL_INVALID_ARG_VALUE: return "CL_INVALID_ARG_VALUE";
+        case CL_INVALID_ARG_SIZE: return "CL_INVALID_ARG_SIZE";
+        case CL_INVALID_KERNEL_ARGS: return "CL_INVALID_KERNEL_ARGS";
+        case CL_INVALID_WORK_DIMENSION: return "CL_INVALID_WORK_DIMENSION";
+        case CL_INVALID_WORK_GROUP_SIZE: return "CL_INVALID_WORK_GROUP_SIZE";
+        case CL_INVALID_WORK_ITEM_SIZE: return "CL_INVALID_WORK_ITEM_SIZE";
+        case CL_INVALID_GLOBAL_OFFSET: return "CL_INVALID_GLOBAL_OFFSET";
+        case CL_INVALID_EVENT_WAIT_LIST: return "CL_INVALID_EVENT_WAIT_LIST";
+        case CL_INVALID_EVENT: return "CL_INVALID_EVENT";
+        case CL_INVALID_OPERATION: return "CL_INVALID_OPERATION";
+        case CL_INVALID_BUFFER_SIZE: return "CL_INVALID_BUFFER_SIZE";
+        case CL_INVALID_GLOBAL_WORK_SIZE: return "CL_INVALID_GLOBAL_WORK_SIZE";
+        case -1001: return "CL_PLATFORM_NOT_FOUND_KHR";
+        default: return "CL_UNKNOWN_ERROR";
+    }
+}
+
+bool is_oom_status(cl_int status) noexcept {
+    return status == CL_MEM_OBJECT_ALLOCATION_FAILURE ||
+           status == CL_OUT_OF_RESOURCES ||
+           status == CL_OUT_OF_HOST_MEMORY;
+}
+
+std::string format_bytes(std::size_t bytes) {
+    char buf[64];
+    if (bytes >= (1ULL << 20)) {
+        std::snprintf(buf, sizeof(buf), "%.2f MiB (%zu bytes)",
+                      static_cast<double>(bytes) / (1024.0 * 1024.0), bytes);
+    } else if (bytes >= 1024ULL) {
+        std::snprintf(buf, sizeof(buf), "%.2f KiB (%zu bytes)",
+                      static_cast<double>(bytes) / 1024.0, bytes);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%zu bytes", bytes);
+    }
+    return buf;
+}
+
 void check(cl_int status, std::string_view action) {
-    TORCH_CHECK(status == CL_SUCCESS, "Iris OpenCL ", action, " failed (", status, ")");
+    if (status == CL_SUCCESS) {
+        return;
+    }
+    if (is_oom_status(status)) {
+        TORCH_CHECK_WITH(
+            OutOfMemoryError, false,
+            "Iris OpenCL ", action, " failed with out-of-memory (", cl_error_name(status), ", ", status,
+            "). Try calling torch_iris.empty_cache() or reducing tensor/batch size.");
+    }
+    TORCH_CHECK(false, "Iris OpenCL ", action, " failed (", cl_error_name(status), ", ", status, ")");
 }
 
 template <typename Handle, auto Release>
@@ -154,13 +232,23 @@ struct Device {
     bool fp16;
     bool reqd_sg8;
     bool subgroups;
+    cl_ulong max_allocation;
+    cl_ulong total_memory;
+    std::string driver_version;
 };
 
 Device find_device() {
     cl_uint platform_count = 0;
-    check(cl().clGetPlatformIDs(0, nullptr, &platform_count), "enumerate platforms");
+    const auto plat_status = cl().clGetPlatformIDs(0, nullptr, &platform_count);
+    if (plat_status == -1001 || (plat_status == CL_SUCCESS && platform_count == 0)) {
+        TORCH_CHECK(false,
+                    "No Intel Iris Xe OpenCL GPU was found (no OpenCL platforms available). "
+                    "Verify that an Intel Iris Xe GPU and an Intel graphics driver with OpenCL support are installed.");
+    }
+    check(plat_status, "enumerate platforms");
     std::vector<cl_platform_id> platforms(platform_count);
     check(cl().clGetPlatformIDs(platform_count, platforms.data(), nullptr), "list platforms");
+    std::vector<std::string> discovered_gpus;
     for (auto platform : platforms) {
         cl_uint count = 0;
         const auto status = cl().clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &count);
@@ -180,6 +268,7 @@ Device find_device() {
             if (!name.empty() && name.back() == '\0') {
                 name.pop_back();
             }
+            discovered_gpus.push_back(name);
             auto lower = name;
             std::transform(lower.begin(), lower.end(), lower.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -199,14 +288,41 @@ Device find_device() {
                     std::string extensions(extension_size, '\0');
                     check(cl().clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, extensions.size(),
                                                extensions.data(), nullptr), "read GPU extensions");
+                    cl_ulong max_alloc = 0;
+                    cl_ulong total_mem = 0;
+                    check(cl().clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc),
+                                               &max_alloc, nullptr), "read max_mem_alloc_size");
+                    check(cl().clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(total_mem),
+                                               &total_mem, nullptr), "read global_mem_size");
+                    std::size_t drv_size = 0;
+                    std::string drv_ver;
+                    if (cl().clGetDeviceInfo(device, CL_DRIVER_VERSION, 0, nullptr, &drv_size) == CL_SUCCESS &&
+                        drv_size > 0) {
+                        drv_ver.resize(drv_size, '\0');
+                        if (cl().clGetDeviceInfo(device, CL_DRIVER_VERSION, drv_size, drv_ver.data(), nullptr) == CL_SUCCESS &&
+                            !drv_ver.empty() && drv_ver.back() == '\0') {
+                            drv_ver.pop_back();
+                        }
+                    }
                     return {device, std::move(name), extensions.find("cl_khr_fp16") != std::string::npos,
                             extensions.find("cl_intel_required_subgroup_size") != std::string::npos,
-                            extensions.find("cl_intel_subgroups") != std::string::npos};
+                            extensions.find("cl_intel_subgroups") != std::string::npos,
+                            max_alloc, total_mem, std::move(drv_ver)};
                 }
             }
         }
     }
-    TORCH_CHECK(false, "Iris requires an available Intel Iris Xe OpenCL GPU with a compiler");
+    std::string found_list;
+    for (std::size_t i = 0; i < discovered_gpus.size(); ++i) {
+        if (i > 0) found_list += ", ";
+        found_list += discovered_gpus[i];
+    }
+    if (found_list.empty()) {
+        found_list = "none";
+    }
+    TORCH_CHECK(false,
+                "No available Intel Iris Xe OpenCL GPU with compiler support was found (discovered OpenCL GPUs: ",
+                found_list, "). Install or update the Intel graphics driver with OpenCL support.");
 }
 
 const Device& device() {
@@ -277,7 +393,33 @@ public:
         check_async_errors_locked(queue_at(current_queue_id).handle.get());
     }
 
+    void check_allocation_limit(std::size_t bytes) const {
+        const auto max_alloc = static_cast<std::size_t>(device().max_allocation);
+        if (max_alloc > 0 && bytes > max_alloc) {
+            TORCH_CHECK_WITH(
+                OutOfMemoryError, false,
+                "Iris allocation of ", format_bytes(bytes),
+                " exceeds the OpenCL device's max_mem_alloc_size limit of ", format_bytes(max_alloc),
+                " on ", device().name,
+                ". Reduce tensor/batch size or split the workload.");
+        }
+    }
+
+    void reclaim_cache_locked() noexcept {
+        clear_cache_locked();
+        for (auto& queue : queues_) {
+            (void)cl().clFlush(queue.handle.get());
+        }
+        for (auto& queue : queues_) {
+            (void)cl().clFinish(queue.handle.get());
+            queue.completed_generation = queue.generation;
+        }
+        reap_transfers();
+        ++stats_.cache_reclaims;
+    }
+
     cl_mem allocate(std::size_t bytes, void* data = nullptr) const {
+        check_allocation_limit(bytes);
         cl_int status = CL_SUCCESS;
         const cl_mem_flags flags = data ? CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR
                                         : CL_MEM_READ_WRITE;
@@ -288,6 +430,7 @@ public:
 
 
     cl_mem allocate_tensor(std::size_t bytes) {
+        check_allocation_limit(bytes);
         const std::lock_guard lock(mutex_);
         const CacheKey key{bytes, current_queue_id};
         Buffer buffer;
@@ -297,14 +440,28 @@ public:
             stats_.cached_bytes -= bytes;
             ++stats_.reuses;
         } else {
-            try {
-                buffer.reset(allocate(bytes));
-            } catch (const c10::Error&) {
-                if (cached_.empty()) {
-                    throw;
+            cl_int status = CL_SUCCESS;
+            buffer.reset(cl().clCreateBuffer(context_.get(), CL_MEM_READ_WRITE, bytes, nullptr, &status));
+            if (status != CL_SUCCESS && (is_oom_status(status) || status == CL_INVALID_BUFFER_SIZE)) {
+                if (!cached_.empty() || !pending_.empty()) {
+                    reclaim_cache_locked();
+                    status = CL_SUCCESS;
+                    buffer.reset(cl().clCreateBuffer(context_.get(), CL_MEM_READ_WRITE, bytes, nullptr, &status));
                 }
-                clear_cache_locked();
-                buffer.reset(allocate(bytes));
+            }
+            if (status != CL_SUCCESS) {
+                if (is_oom_status(status) || status == CL_INVALID_BUFFER_SIZE) {
+                    TORCH_CHECK_WITH(
+                        OutOfMemoryError, false,
+                        "Iris OpenCL out of memory allocating ", format_bytes(bytes),
+                        " on ", device().name, " (", cl_error_name(status), ", ", status,
+                        "; allocated=", format_bytes(stats_.allocated_bytes),
+                        ", cached=", format_bytes(stats_.cached_bytes),
+                        ", total_memory=", format_bytes(static_cast<std::size_t>(device().total_memory)),
+                        ", max_mem_alloc_size=", format_bytes(static_cast<std::size_t>(device().max_allocation)),
+                        "). Try calling torch_iris.empty_cache() or reducing tensor/batch size.");
+                }
+                check(status, "allocate buffer");
             }
             ++stats_.allocations;
         }
@@ -431,6 +588,7 @@ public:
     }
 
     void* pin(std::size_t bytes) {
+        check_allocation_limit(bytes);
         const std::lock_guard lock(mutex_);
         auto block = std::make_shared<PinnedBuffer>();
         block->bytes = bytes;
@@ -438,6 +596,12 @@ public:
         cl_int status = CL_SUCCESS;
         block->buffer.reset(cl().clCreateBuffer(context_.get(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
                                                bytes, nullptr, &status));
+        if (status != CL_SUCCESS && is_oom_status(status) && (!cached_.empty() || !pending_.empty())) {
+            reclaim_cache_locked();
+            status = CL_SUCCESS;
+            block->buffer.reset(cl().clCreateBuffer(context_.get(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                                                   bytes, nullptr, &status));
+        }
         check(status, "allocate pinned host memory");
         block->address = cl().clEnqueueMapBuffer(block->queue, block->buffer.get(), CL_TRUE,
                                                 CL_MAP_READ | CL_MAP_WRITE, 0, bytes, 0, nullptr, nullptr, &status);
@@ -714,8 +878,31 @@ private:
             0, nullptr, nullptr);
         if (status == CL_SUCCESS) {
             submissions.fetch_add(1, std::memory_order_relaxed);
+            return status;
         }
-        return status;
+        std::string dims = "global=[";
+        for (std::size_t i = 0; i < Rank; ++i) {
+            if (i > 0) dims += ",";
+            dims += std::to_string(size[i]);
+        }
+        dims += "]";
+        if (local) {
+            dims += " local=[";
+            for (std::size_t i = 0; i < Rank; ++i) {
+                if (i > 0) dims += ",";
+                dims += std::to_string(local[i]);
+            }
+            dims += "]";
+        }
+        if (is_oom_status(status)) {
+            TORCH_CHECK_WITH(
+                OutOfMemoryError, false,
+                "Iris OpenCL enqueue kernel '", name, "' failed with out-of-memory (",
+                cl_error_name(status), ", ", status, "; ", dims,
+                "). Try calling torch_iris.empty_cache() or reducing tensor/batch size.");
+        }
+        TORCH_CHECK(false, "Iris OpenCL enqueue kernel '", name, "' failed (",
+                    cl_error_name(status), ", ", status, "; ", dims, ")");
     }
 
     const MatmulTile* select_matmul_tile(MatrixView left, MatrixView right, cl_ulong batches,
@@ -844,13 +1031,17 @@ private:
                         log.pop_back();
                     }
                 }
-                TORCH_CHECK(false, "Iris OpenCL kernel build failed (", status, "): ", log);
+                TORCH_CHECK(false, "Iris OpenCL kernel build failed (", cl_error_name(status), ", ", status,
+                            ") on ", device().name, " (driver ", device().driver_version, "): ", log);
             }
             program_ = std::move(program);
         }
         cl_int status = CL_SUCCESS;
         Kernel function(cl().clCreateKernel(program_.get(), name, &status));
-        check(status, name);
+        if (status != CL_SUCCESS) {
+            TORCH_CHECK(false, "Iris OpenCL create kernel '", name, "' failed (",
+                        cl_error_name(status), ", ", status, ")");
+        }
         return kernels_.emplace(name, std::move(function)).first->second.get();
     }
 
@@ -1750,6 +1941,7 @@ void conv_transpose2d_forward(BufferSlice output, BufferSlice input, BufferSlice
                               const Conv2dParams& p, bool fp16) {
     const std::size_t total = static_cast<std::size_t>(p.n) * static_cast<std::size_t>(p.c_out) *
                               static_cast<std::size_t>(p.oh) * static_cast<std::size_t>(p.ow);
+    if (!total) return;
     constexpr std::size_t local[] = {128};
     const std::size_t size[] = {((total + 127) / 128) * 128};
     runtime().run_local("conv_transpose2d_fwd_general", size, local,
@@ -1877,7 +2069,7 @@ void layer_norm_grad_input_fast(BufferSlice dx, BufferSlice grad, BufferSlice in
 void layer_norm_grad_affine_fast(BufferSlice dw, BufferSlice db, BufferSlice grad, BufferSlice input,
                                  BufferSlice mean_buf, BufferSlice rstd_buf, cl_int rows, cl_int width,
                                  bool in_fp16, bool param_fp16) {
-    if (!width) return;
+    if (rows <= 0 || width <= 0) return;
     constexpr std::size_t local[] = {64};
     const std::size_t size[] = {((static_cast<std::size_t>(width) + 63) / 64) * 64};
     runtime().run_local("ln_grad_affine_fast", size, local,

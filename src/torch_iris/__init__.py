@@ -1,6 +1,6 @@
 """Register Intel Iris Xe as a PyTorch device."""
 
-__version__ = "0.16.0"
+__version__ = "0.16.1"
 
 from contextlib import contextmanager
 import sys
@@ -189,6 +189,36 @@ def get_amp_supported_dtype():
 def is_bf16_supported(including_emulation=True):
     """Report BF16 storage and FP32-based arithmetic emulation availability."""
     return including_emulation and is_available()
+
+
+def fallback_stats():
+    """Return a dict mapping ATen operator names to CPU fallback invocation counts."""
+    return dict(_C.fallback_stats())
+
+
+def reset_fallback_stats():
+    """Reset CPU fallback counters and once-per-operator warning tracking."""
+    _C.reset_fallback_stats()
+
+
+def is_cpu_fallback_enabled():
+    """Return whether automatic CPU fallback is enabled for unimplemented ops."""
+    return bool(_C.is_cpu_fallback_enabled())
+
+
+def set_cpu_fallback_enabled(enabled: bool):
+    """Enable or disable automatic CPU fallback (False enables strict GPU-only mode)."""
+    _C.set_cpu_fallback_enabled(bool(enabled))
+
+
+def is_fallback_warning_enabled():
+    """Return whether once-per-operator CPU fallback warnings are enabled."""
+    return bool(_C.is_fallback_warning_enabled())
+
+
+def set_fallback_warning_enabled(enabled: bool):
+    """Enable or disable once-per-operator CPU fallback warnings."""
+    _C.set_fallback_warning_enabled(bool(enabled))
 
 
 if backend != "iris":

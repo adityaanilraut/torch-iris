@@ -1,3 +1,4 @@
+#include "fallback.h"
 #include "opencl_runtime.h"
 #include "rng_internal.h"
 
@@ -612,6 +613,14 @@ at::Tensor& copy_(at::Tensor& destination, const at::Tensor& source, bool non_bl
 
 at::Tensor copy_from(const at::Tensor& source, const at::Tensor& destination, bool non_blocking) {
     copy_tensor(destination, source, non_blocking);
+    return destination;
+}
+
+at::Tensor copy_from_and_resize(const at::Tensor& source, const at::Tensor& destination) {
+    if (destination.sizes() != source.sizes()) {
+        destination.resize_(source.sizes());
+    }
+    copy_tensor(destination, source, false);
     return destination;
 }
 
@@ -3164,7 +3173,9 @@ at::Tensor mse_loss_backward(
     check_operand(input);
     check_operand(target);
     check_reduction(reduction);
-    const auto scale = reduction == at::Reduction::Mean ? 2.0f / input.numel() : 2.0f;
+    const auto scale = reduction == at::Reduction::Mean
+        ? (input.numel() ? 2.0f / static_cast<float>(input.numel()) : 0.0f)
+        : 2.0f;
     at::Tensor difference;
     if (input.scalar_type() == at::kFloat && target.scalar_type() == at::kFloat &&
         input.sizes() == target.sizes() && packed(input) && packed(target)) {
@@ -3320,6 +3331,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, library) {
     library.impl("_local_scalar_dense", &local_scalar);
     library.impl("copy_", &copy_);
     library.impl("_copy_from", &copy_from);
+    library.impl("_copy_from_and_resize", &copy_from_and_resize);
     library.impl("_to_copy", &to_copy);
     library.impl("record_stream", &record_tensor_stream);
     library.impl("as_strided", &at::native::as_strided_tensorimpl);
@@ -3700,8 +3712,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         output["reuses"] = stats.reuses;
         output["peak_allocated_bytes"] = stats.peak_allocated_bytes;
         output["peak_reserved_bytes"] = stats.peak_reserved_bytes;
+        output["cache_reclaims"] = stats.cache_reclaims;
         return output;
     });
+    module.def("fallback_stats", &iris::fallback_stats);
+    module.def("reset_fallback_stats", &iris::reset_fallback_stats);
+    module.def("is_cpu_fallback_enabled", &iris::is_cpu_fallback_enabled);
+    module.def("set_cpu_fallback_enabled", &iris::set_cpu_fallback_enabled);
+    module.def("is_fallback_warning_enabled", &iris::is_fallback_warning_enabled);
+    module.def("set_fallback_warning_enabled", &iris::set_fallback_warning_enabled);
     module.def("_reset_peak_memory_stats", &iris::reset_peak_memory_stats);
     module.def("_is_initialized", &iris::context_initialized);
     module.def("_init", &iris::initialize);

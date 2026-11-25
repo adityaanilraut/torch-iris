@@ -320,16 +320,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> conv_backward(
             const auto data = input.contiguous();
             grad_weight = at::empty(weight.sizes(), weight.options());
             if (grad_weight.numel()) {
-                const int64_t np = static_cast<int64_t>(dual.n) * dual.oh * dual.ow;
-                const int64_t k_col = static_cast<int64_t>(dual.c_in / dual.groups) * dual.kh * dual.kw;
-                const int64_t w_tiles = ((dual.c_out / dual.groups + 31) / 32) * dual.groups * ((k_col + 31) / 32);
-                const int64_t max_mem_split = std::max<int64_t>(1, (8LL * 1024 * 1024) / std::max<int64_t>(1, grad_weight.numel() * 4));
-                int64_t split_k = np >= 512 ? std::min<int64_t>({16, max_mem_split, np / 256, std::max<int64_t>(1, 160 / std::max<int64_t>(1, w_tiles))}) : 1;
-                if (split_k < 1) split_k = 1;
-                at::Tensor partial;
-                if (split_k > 1) partial = at::empty({split_k, grad_weight.numel()}, weight.options().dtype(at::kFloat));
-                conv2d_grad_weight(buf_slice(grad_weight), buf_slice(partial), buf_slice(data), buf_slice(packed_grad), dual,
-                                   static_cast<cl_int>(split_k), fp16);
+                if (!packed_grad.numel() || !data.numel()) {
+                    grad_weight.zero_();
+                } else {
+                    const int64_t np = static_cast<int64_t>(dual.n) * dual.oh * dual.ow;
+                    const int64_t k_col = static_cast<int64_t>(dual.c_in / dual.groups) * dual.kh * dual.kw;
+                    const int64_t w_tiles = ((dual.c_out / dual.groups + 31) / 32) * dual.groups * ((k_col + 31) / 32);
+                    const int64_t max_mem_split = std::max<int64_t>(1, (8LL * 1024 * 1024) / std::max<int64_t>(1, grad_weight.numel() * 4));
+                    int64_t split_k = np >= 512 ? std::min<int64_t>({16, max_mem_split, np / 256, std::max<int64_t>(1, 160 / std::max<int64_t>(1, w_tiles))}) : 1;
+                    if (split_k < 1) split_k = 1;
+                    at::Tensor partial;
+                    if (split_k > 1) partial = at::empty({split_k, grad_weight.numel()}, weight.options().dtype(at::kFloat));
+                    conv2d_grad_weight(buf_slice(grad_weight), buf_slice(partial), buf_slice(data), buf_slice(packed_grad), dual,
+                                       static_cast<cl_int>(split_k), fp16);
+                }
             }
         }
         if (mask[2]) {
@@ -365,20 +369,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> conv_backward(
         const auto data = input.contiguous();
         grad_weight = at::empty(weight.sizes(), weight.options());
         if (grad_weight.numel()) {
-            const int64_t np = static_cast<int64_t>(p.n) * p.oh * p.ow;
-            const int64_t k_col = static_cast<int64_t>(p.c_in / p.groups) * p.kh * p.kw;
-            const int64_t w_tiles = ((p.c_out / p.groups + 31) / 32) * p.groups * ((k_col + 31) / 32);
-            const int64_t max_mem_split = std::max<int64_t>(1, (8LL * 1024 * 1024) / std::max<int64_t>(1, grad_weight.numel() * 4));
-            int64_t split_k = np >= 512 ? std::min<int64_t>({16, max_mem_split, np / 256, std::max<int64_t>(1, 160 / std::max<int64_t>(1, w_tiles))}) : 1;
-            if (split_k < 1) {
-                split_k = 1;
+            if (!packed_grad.numel() || !data.numel()) {
+                grad_weight.zero_();
+            } else {
+                const int64_t np = static_cast<int64_t>(p.n) * p.oh * p.ow;
+                const int64_t k_col = static_cast<int64_t>(p.c_in / p.groups) * p.kh * p.kw;
+                const int64_t w_tiles = ((p.c_out / p.groups + 31) / 32) * p.groups * ((k_col + 31) / 32);
+                const int64_t max_mem_split = std::max<int64_t>(1, (8LL * 1024 * 1024) / std::max<int64_t>(1, grad_weight.numel() * 4));
+                int64_t split_k = np >= 512 ? std::min<int64_t>({16, max_mem_split, np / 256, std::max<int64_t>(1, 160 / std::max<int64_t>(1, w_tiles))}) : 1;
+                if (split_k < 1) {
+                    split_k = 1;
+                }
+                at::Tensor partial;
+                if (split_k > 1) {
+                    partial = at::empty({split_k, grad_weight.numel()}, weight.options().dtype(at::kFloat));
+                }
+                conv2d_grad_weight(buf_slice(grad_weight), buf_slice(partial), buf_slice(packed_grad), buf_slice(data), p,
+                                   static_cast<cl_int>(split_k), fp16);
             }
-            at::Tensor partial;
-            if (split_k > 1) {
-                partial = at::empty({split_k, grad_weight.numel()}, weight.options().dtype(at::kFloat));
-            }
-            conv2d_grad_weight(buf_slice(grad_weight), buf_slice(partial), buf_slice(packed_grad), buf_slice(data), p,
-                               static_cast<cl_int>(split_k), fp16);
         }
     }
     if (mask[2]) {
@@ -517,11 +525,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> layer_norm(
     auto output = at::empty(input.sizes(), input.options());
     auto mean = at::empty(config.stats_shape, input.options());
     auto rstd = at::empty(config.stats_shape, input.options());
-    const auto packed = input.contiguous();
-    layer_norm_forward_fast(buf_slice(output), buf_slice(packed), buf_slice(affine), buf_slice(offset),
-                            buf_slice(mean), buf_slice(rstd), config.rows,
-                            static_cast<cl_int>(config.width), static_cast<float>(epsilon),
-                            in_fp16, param_fp16);
+    if (output.numel()) {
+        const auto packed = input.contiguous();
+        layer_norm_forward_fast(buf_slice(output), buf_slice(packed), buf_slice(affine), buf_slice(offset),
+                                buf_slice(mean), buf_slice(rstd), config.rows,
+                                static_cast<cl_int>(config.width), static_cast<float>(epsilon),
+                                in_fp16, param_fp16);
+    }
     return {output, mean, rstd};
 }
 
@@ -561,10 +571,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> layer_norm_backward(
         db = at::empty(normalized_shape, input.options().dtype(param_dtype));
     }
     if (mask[1] || mask[2]) {
-        layer_norm_grad_affine_fast(buf_slice(dw), buf_slice(db), buf_slice(packed_grad), buf_slice(packed),
-                                    buf_slice(packed_mean), buf_slice(packed_rstd),
-                                    static_cast<cl_int>(config.rows), static_cast<cl_int>(config.width),
-                                    in_fp16, param_fp16);
+        if (config.rows == 0 || config.width == 0) {
+            if (dw.defined()) dw.zero_();
+            if (db.defined()) db.zero_();
+        } else {
+            layer_norm_grad_affine_fast(buf_slice(dw), buf_slice(db), buf_slice(packed_grad), buf_slice(packed),
+                                        buf_slice(packed_mean), buf_slice(packed_rstd),
+                                        static_cast<cl_int>(config.rows), static_cast<cl_int>(config.width),
+                                        in_fp16, param_fp16);
+        }
     }
     return {dx, dw, db};
 }

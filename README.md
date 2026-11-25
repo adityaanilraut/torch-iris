@@ -30,7 +30,7 @@ py -3.12 -m venv .venv-iris
 
 ### Option 2: Install the prebuilt wheel from GitHub Releases
 
-Download `torch_iris-0.16.0-cp312-cp312-win_amd64.whl` from the [GitHub Releases](https://github.com/adityaanilraut/torch-iris/releases/tag/v0.16.0) page, then run:
+Download `torch_iris-0.16.1-cp312-cp312-win_amd64.whl` from the [GitHub Releases](https://github.com/adityaanilraut/torch-iris/releases/tag/v0.16.1) page, then run:
 
 ```powershell
 py -3.12 -m venv .venv-iris
@@ -40,7 +40,7 @@ $iris = '.\.venv-iris\Scripts\python.exe'
 & $iris -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
 
 # 2. Install the torch-iris extension wheel
-& $iris -m pip install --no-deps .\torch_iris-0.16.0-cp312-cp312-win_amd64.whl
+& $iris -m pip install --no-deps .\torch_iris-0.16.1-cp312-cp312-win_amd64.whl
 ```
 
 ### Option 3: Build from source
@@ -56,7 +56,7 @@ $iris = '.\.venv-iris\Scripts\python.exe'
 & $iris -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
 & $iris -m pip install setuptools wheel
 & $iris -m pip wheel --no-build-isolation --no-deps --wheel-dir dist .
-& $iris -m pip install --force-reinstall --no-deps dist\torch_iris-0.16.0-cp312-cp312-win_amd64.whl
+& $iris -m pip install --force-reinstall --no-deps dist\torch_iris-0.16.1-cp312-cp312-win_amd64.whl
 ```
 
 ---
@@ -82,7 +82,7 @@ model = torch.nn.Sequential(
 inputs = torch.randn(64, 32, device=device)
 targets = torch.randn(64, 8, device=device)
 
-optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9, foreach=False)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 optimizer.zero_grad(set_to_none=True)
 loss = torch.nn.functional.mse_loss(model(inputs), targets)
 loss.backward()
@@ -136,6 +136,26 @@ restored = torch_iris.from_dlpack(capsule)
 
 ---
 
+## Reliability & CPU Fallback
+
+Starting in **`0.16.1`**, `torch-iris` registers an observable `PrivateUse1` boxed **CPU fallback** for ATen operators that do not have a native OpenCL implementation, so everyday PyTorch workloads continue to run instead of aborting with `NotImplementedError`:
+
+- **Native kernels always take precedence:** All native OpenCL kernels and PyTorch `CompositeExplicitAutograd` decompositions run directly on Intel Iris Xe without touching CPU.
+- **Once-per-operator warning:** The first time an unimplemented operator falls back to CPU, `torch-iris` emits a `UserWarning` naming the operator so host/device transfers are never hidden. Set `TORCH_IRIS_FALLBACK_WARN=0` (or call `torch_iris.set_fallback_warning_enabled(False)`) to silence warnings.
+- **Inspect fallback usage:** Call `torch_iris.fallback_stats()` to see a `{op_name: count}` dictionary of every operator that fell back to CPU, and `torch_iris.reset_fallback_stats()` to clear counters:
+
+```python
+torch_iris.reset_fallback_stats()
+# ... run your model or training loop ...
+print(torch_iris.fallback_stats())  # {} when 100% native on Iris Xe
+```
+
+- **Strict GPU-only mode:** Disable CPU fallback via the environment variable `TORCH_IRIS_CPU_FALLBACK=0` or at runtime with `torch_iris.set_cpu_fallback_enabled(False)` (check with `torch_iris.is_cpu_fallback_enabled()`). In strict mode, unimplemented operators raise `NotImplementedError` immediately.
+- **FP64 remains explicit:** Intel Iris Xe OpenCL lacks `float64` storage, so `float64` / `complex128` allocations on `iris:0` still fail explicitly rather than being silently downcast.
+- **Defensive OpenCL memory handling:** Allocations exceeding `max_mem_alloc_size` raise a clear `torch.OutOfMemoryError`, and out-of-memory allocations automatically flush and reclaim cached device buffers before failing.
+
+---
+
 ## Known Limitations & Performance Notes
 
 - **No FP64 (`float64`) storage:** Intel Iris Xe OpenCL drivers do not expose `cl_khr_fp64`. Operations requiring `float64` storage are intentionally unsupported rather than silently downcast.
@@ -159,7 +179,7 @@ Install `pytest` (and `torchvision` for vision tests) in your environment and ru
 & $iris -m pytest -p no:cacheprovider -q tests
 
 # Run standalone parity scopes against the built wheel
-$wheel = 'dist\torch_iris-0.16.0-cp312-cp312-win_amd64.whl'
+$wheel = 'dist\torch_iris-0.16.1-cp312-cp312-win_amd64.whl'
 foreach ($scope in 'forward', 'training', 'operators') {
     & $iris -m parity.run iris --scope $scope --wheel $wheel --output "parity-$scope.json"
 }

@@ -1,0 +1,324 @@
+"""Tests for boxed CPU fallback, observability, ergonomics, and OpenCL hardening."""
+
+import copy
+import os
+import subprocess
+import sys
+import warnings
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+import torch_iris
+from parity.operators import OPERATOR_SCOPE, run_operator_case
+from parity.training import TRAINING_SCOPE, run_training_case
+from parity.workloads import SCOPE, compare, run_case
+
+
+pytestmark = pytest.mark.skipif(not torch_iris.is_available(), reason="requires Intel Iris Xe")
+DEVICE = torch.device("iris:0")
+
+
+@pytest.fixture(autouse=True)
+def _reset_fallback_state():
+    torch_iris.set_cpu_fallback_enabled(True)
+    torch_iris.set_fallback_warning_enabled(True)
+    torch_iris.reset_fallback_stats()
+    yield
+    torch_iris.set_cpu_fallback_enabled(True)
+    torch_iris.set_fallback_warning_enabled(True)
+    torch_iris.reset_fallback_stats()
+
+
+def test_unimplemented_op_cpu_fallback_stats_and_once_warning():
+    host = torch.tensor([-2.5, -0.5, 0.0, 1.25, 4.0], dtype=torch.float32)
+    x = host.to(DEVICE)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out1 = torch.special.i0e(x)
+        out2 = torch.special.i0e(x)
+
+    assert out1.device == DEVICE
+    torch.testing.assert_close(out1.cpu(), torch.special.i0e(host), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out2.cpu(), torch.special.i0e(host), rtol=1e-5, atol=1e-6)
+
+    stats = torch_iris.fallback_stats()
+    assert stats.get("aten::special_i0e.out") == 2
+
+    fallback_warnings = [w for w in caught if "special_i0e" in str(w.message)]
+    assert len(fallback_warnings) == 1
+
+    # Reset clears counters and allows warning once again.
+    torch_iris.reset_fallback_stats()
+    assert torch_iris.fallback_stats() == {}
+    with warnings.catch_warnings(record=True) as caught_again:
+        warnings.simplefilter("always")
+        _ = torch.special.i0e(x)
+    assert len([w for w in caught_again if "special_i0e" in str(w.message)]) == 1
+
+    # Silencing warnings still runs fallback and records stats.
+    torch_iris.reset_fallback_stats()
+    torch_iris.set_fallback_warning_enabled(False)
+    assert not torch_iris.is_fallback_warning_enabled()
+    with warnings.catch_warnings(record=True) as silenced:
+        warnings.simplefilter("always")
+        _ = torch.special.i0e(x)
+    assert [w for w in silenced if "special_i0e" in str(w.message)] == []
+    assert torch_iris.fallback_stats().get("aten::special_i0e.out") == 1
+
+
+def test_strict_gpu_only_mode_blocks_fallback():
+    x = torch.randn(4, device=DEVICE)
+    torch_iris.set_cpu_fallback_enabled(False)
+    assert not torch_iris.is_cpu_fallback_enabled()
+
+    with pytest.raises(NotImplementedError, match="CPU fallback is disabled"):
+        _ = torch.special.i0e(x)
+
+    assert torch_iris.fallback_stats() == {}
+
+    # Native ops continue to work in strict GPU-only mode.
+    y = (x * 2.0 + 1.0).relu().sum()
+    assert y.device == DEVICE
+    assert torch_iris.fallback_stats() == {}
+
+
+def test_env_var_controls_in_fresh_subprocess():
+    env_strict = os.environ.copy()
+    env_strict["TORCH_IRIS_CPU_FALLBACK"] = "0"
+    env_strict["TORCH_IRIS_FALLBACK_WARN"] = "0"
+    script = (
+        "import torch, torch_iris\n"
+        "assert not torch_iris.is_cpu_fallback_enabled()\n"
+        "assert not torch_iris.is_fallback_warning_enabled()\n"
+        "x = torch.randn(4, device='iris')\n"
+        "try:\n"
+        "    torch.special.i0e(x)\n"
+        "    raise SystemExit('expected NotImplementedError')\n"
+        "except NotImplementedError:\n"
+        "    pass\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], env=env_strict, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+
+
+def test_fallback_out_inplace_multi_output_strided_and_autograd():
+    torch_iris.set_fallback_warning_enabled(False)
+
+    # 1. Multi-tensor output (torch.frexp returns (mantissa, exponent))
+    host = torch.tensor([[-3.5, 0.25, 8.0, 1.5], [0.0, -0.125, 16.0, 7.25]], dtype=torch.float32)
+    strided_host = host.T
+    strided_iris = host.to(DEVICE).T
+    m_cpu, e_cpu = torch.frexp(strided_host)
+    m_iris, e_iris = torch.frexp(strided_iris)
+    assert m_iris.device == DEVICE and e_iris.device == DEVICE
+    torch.testing.assert_close(m_iris.cpu(), m_cpu, rtol=0, atol=0)
+    torch.testing.assert_close(e_iris.cpu(), e_cpu, rtol=0, atol=0)
+    assert torch_iris.fallback_stats().get("aten::frexp.Tensor_out", 0) >= 1
+
+    # 2. out= into a non-contiguous strided view
+    storage_host = torch.full((4, 6), -99.0)
+    storage_iris = storage_host.to(DEVICE)
+    out_host = storage_host[:, ::3]  # shape (4, 2), non-contiguous
+    out_iris = storage_iris[:, ::3]
+    torch.special.i0e(strided_host, out=out_host)
+    returned = torch.special.i0e(strided_iris, out=out_iris)
+    assert returned is out_iris
+    torch.testing.assert_close(storage_iris.cpu(), storage_host, rtol=1e-5, atol=1e-6)
+
+    # 3. In-place op on a strided view (aten::special_i0e_ or aten::cauchy_? Use aten::cholesky_inverse / linalg / erfcx / etc.)
+    base_host = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=torch.float32)
+    base_iris = base_host.to(DEVICE)
+    view_host = base_host[:, ::2]
+    view_iris = base_iris[:, ::2]
+    # aten::lgamma_ is native; use aten::special_i0e via out=view (mutates view in-place) and aten::hypot?
+    # Test a genuine in-place fallback op: aten::igamma_ (not natively implemented on Iris)
+    a_host = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    x_host = torch.tensor([[0.5, 1.5], [2.5, 3.5]], dtype=torch.float32)
+    a_base_host = torch.zeros(2, 4)
+    a_base_host[:, ::2] = a_host
+    a_base_iris = a_base_host.to(DEVICE)
+    ret_inplace = a_base_iris[:, ::2].igamma_(x_host.to(DEVICE))
+    a_base_host[:, ::2].igamma_(x_host)
+    assert ret_inplace.device == DEVICE
+    torch.testing.assert_close(a_base_iris.cpu(), a_base_host, rtol=1e-5, atol=1e-6)
+    assert any("igamma" in k for k in torch_iris.fallback_stats())
+
+    # 4. Autograd forward + backward through fallback (cholesky_inverse & special.i0e)
+    lower_cpu = torch.tensor([[2.0, 0.0, 0.0], [0.5, 1.5, 0.0], [-0.25, 0.4, 1.2]], requires_grad=True)
+    lower_iris = lower_cpu.detach().to(DEVICE).requires_grad_()
+    inv_cpu = torch.cholesky_inverse(lower_cpu)
+    inv_iris = torch.cholesky_inverse(lower_iris)
+    assert inv_iris.device == DEVICE
+    torch.testing.assert_close(inv_iris.cpu(), inv_cpu, rtol=1e-4, atol=1e-5)
+    inv_cpu.square().sum().backward()
+    inv_iris.square().sum().backward()
+    assert lower_iris.grad is not None and lower_iris.grad.device == DEVICE
+    torch.testing.assert_close(lower_iris.grad.cpu(), lower_cpu.grad, rtol=1e-4, atol=1e-5)
+
+    # Also test elementwise fallback with autograd (special.i0e backward uses special_i1e / fallback)
+    z_cpu = torch.tensor([-1.5, 0.25, 2.0], requires_grad=True)
+    z_iris = z_cpu.detach().to(DEVICE).requires_grad_()
+    y_cpu = torch.special.i0e(z_cpu)
+    y_iris = torch.special.i0e(z_iris)
+    torch.testing.assert_close(y_iris.cpu(), y_cpu, rtol=1e-5, atol=1e-6)
+    y_cpu.sum().backward()
+    y_iris.sum().backward()
+    assert z_iris.grad is not None and z_iris.grad.device == DEVICE
+    torch.testing.assert_close(z_iris.grad.cpu(), z_cpu.grad, rtol=1e-5, atol=1e-6)
+
+
+def test_fp64_guard_remains_explicit_with_fallback():
+    props = torch_iris.get_device_properties()
+    if props.double_fp_config == 0:
+        with pytest.raises(RuntimeError, match="storage"):
+            torch.ones(2, device=DEVICE, dtype=torch.float64)
+        with pytest.raises(RuntimeError, match="storage"):
+            torch.kaiser_window(5, device=DEVICE, dtype=torch.float64)
+
+
+def test_boolean_and_integer_reductions_native():
+    torch.manual_seed(42)
+    torch_iris.reset_fallback_stats()
+
+    logits = torch.randn(64, 10)
+    labels = torch.randint(0, 10, (64,))
+    expected = (logits.argmax(dim=1) == labels).sum()
+    actual = (logits.to(DEVICE).argmax(dim=1) == labels.to(DEVICE)).sum()
+    assert actual.device == DEVICE
+    assert actual.dtype == expected.dtype == torch.int64
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+    # Large bool reduction (> 4096 elements) and strided bool reduction
+    big_a = torch.randint(0, 5, (128, 64))
+    big_b = torch.randint(0, 5, (128, 64))
+    big_mask_cpu = (big_a == big_b)
+    big_mask_iris = (big_a.to(DEVICE) == big_b.to(DEVICE))
+    torch.testing.assert_close(big_mask_iris.sum().cpu(), big_mask_cpu.sum(), rtol=0, atol=0)
+    torch.testing.assert_close(big_mask_iris.T[:, ::2].sum(dim=1).cpu(), big_mask_cpu.T[:, ::2].sum(dim=1), rtol=0, atol=0)
+    assert torch_iris.fallback_stats() == {}
+
+
+@pytest.mark.parametrize(
+    "opt_cls,kwargs",
+    [
+        (torch.optim.SGD, {"lr": 0.05, "momentum": 0.9, "weight_decay": 1e-3}),
+        (torch.optim.SGD, {"lr": 0.05, "momentum": 0.9, "weight_decay": 1e-3, "foreach": True}),
+        (torch.optim.SGD, {"lr": 0.05, "momentum": 0.9, "weight_decay": 1e-3, "foreach": False}),
+        (torch.optim.SGD, {"lr": 0.05, "momentum": 0.9, "weight_decay": 1e-3, "fused": True}),
+        (torch.optim.Adam, {"lr": 1e-2, "weight_decay": 1e-3}),
+        (torch.optim.Adam, {"lr": 1e-2, "amsgrad": True, "foreach": True}),
+        (torch.optim.Adam, {"lr": 1e-2, "foreach": False}),
+        (torch.optim.Adam, {"lr": 1e-2, "fused": True}),
+        (torch.optim.AdamW, {"lr": 1e-2, "weight_decay": 1e-2}),
+        (torch.optim.AdamW, {"lr": 1e-2, "amsgrad": True, "foreach": True}),
+        (torch.optim.AdamW, {"lr": 1e-2, "foreach": False}),
+        (torch.optim.AdamW, {"lr": 1e-2, "fused": True}),
+    ],
+)
+def test_standard_optimizers_default_foreach_and_fused_native(opt_cls, kwargs):
+    torch.manual_seed(123)
+    torch_iris.reset_fallback_stats()
+
+    cpu_model = torch.nn.Sequential(
+        torch.nn.Linear(8, 16),
+        torch.nn.ReLU(),
+        torch.nn.Linear(16, 4),
+    )
+    iris_model = copy.deepcopy(cpu_model).to(DEVICE)
+
+    cpu_kwargs = {k: v for k, v in kwargs.items() if k != "fused"}
+    cpu_opt = opt_cls(cpu_model.parameters(), **cpu_kwargs)
+    iris_opt = opt_cls(iris_model.parameters(), **kwargs)
+
+    for _ in range(3):
+        x = torch.randn(4, 8)
+        target = torch.randn(4, 4)
+
+        cpu_opt.zero_grad(set_to_none=True)
+        F.mse_loss(cpu_model(x), target).backward()
+        cpu_opt.step()
+
+        iris_opt.zero_grad(set_to_none=True)
+        F.mse_loss(iris_model(x.to(DEVICE)), target.to(DEVICE)).backward()
+        iris_opt.step()
+
+    for p_iris, p_cpu in zip(iris_model.parameters(), cpu_model.parameters(), strict=True):
+        torch.testing.assert_close(p_iris.cpu(), p_cpu, rtol=1e-4, atol=1e-5)
+
+    assert torch_iris.fallback_stats() == {}
+
+
+def test_empty_and_zero_size_tensors_hardening():
+    torch_iris.reset_fallback_stats()
+
+    # Empty BatchNorm2d train & eval (previously hit float64 accumulate type on CPU composite path)
+    bn_eval = torch.nn.BatchNorm2d(4).to(DEVICE).eval()
+    out_bn_eval = bn_eval(torch.empty(0, 4, 4, 4, device=DEVICE))
+    assert out_bn_eval.shape == (0, 4, 4, 4) and out_bn_eval.device == DEVICE
+
+    bn_train = torch.nn.BatchNorm2d(4).to(DEVICE).train()
+    x_bn = torch.empty(0, 4, 4, 4, device=DEVICE, requires_grad=True)
+    out_bn_train = bn_train(x_bn)
+    assert out_bn_train.shape == (0, 4, 4, 4)
+    out_bn_train.sum().backward()
+    assert x_bn.grad.shape == (0, 4, 4, 4)
+    torch.testing.assert_close(bn_train.weight.grad.cpu(), torch.zeros(4))
+    torch.testing.assert_close(bn_train.bias.grad.cpu(), torch.zeros(4))
+
+    # Empty LayerNorm forward & backward
+    ln = torch.nn.LayerNorm(4).to(DEVICE)
+    x_ln = torch.empty(0, 4, device=DEVICE, requires_grad=True)
+    y_ln = ln(x_ln)
+    assert y_ln.shape == (0, 4)
+    y_ln.sum().backward()
+    torch.testing.assert_close(ln.weight.grad.cpu(), torch.zeros(4))
+    torch.testing.assert_close(ln.bias.grad.cpu(), torch.zeros(4))
+
+    # Empty GroupNorm, Softmax, Linear, CrossEntropy, Pooling, Reductions
+    assert torch.nn.GroupNorm(2, 4).to(DEVICE)(torch.empty(0, 4, 4, 4, device=DEVICE)).shape == (0, 4, 4, 4)
+    assert F.softmax(torch.empty(0, 4, device=DEVICE), dim=-1).shape == (0, 4)
+    assert F.softmax(torch.empty(3, 0, device=DEVICE), dim=-1).shape == (3, 0)
+    assert torch.nn.Linear(4, 8).to(DEVICE)(torch.empty(0, 4, device=DEVICE)).shape == (0, 8)
+    assert F.max_pool2d(torch.empty(0, 4, 4, 4, device=DEVICE), 2).shape == (0, 4, 2, 2)
+    assert F.avg_pool2d(torch.empty(0, 4, 4, 4, device=DEVICE), 2).shape == (0, 4, 2, 2)
+    torch.testing.assert_close(torch.empty(3, 0, device=DEVICE).sum(1).cpu(), torch.zeros(3))
+    torch.testing.assert_close(torch.empty(0, dtype=torch.bool, device=DEVICE).sum().cpu(), torch.tensor(0))
+    assert not torch.empty(0, dtype=torch.bool, device=DEVICE).any().item()
+    assert torch.empty(0, dtype=torch.bool, device=DEVICE).all().item()
+
+    assert torch_iris.fallback_stats() == {}
+
+
+def test_oversized_allocation_and_cache_reclamation():
+    props = torch_iris.get_device_properties()
+    oversized_elems = props.max_allocation // 4 + 1024
+    with pytest.raises((torch.OutOfMemoryError, RuntimeError), match="max_mem_alloc_size"):
+        torch.empty((oversized_elems,), dtype=torch.float32, device=DEVICE)
+
+    # Verify allocator remains healthy after failed allocation and empty_cache reclaims pooled buffers.
+    torch_iris.empty_cache()
+    t = torch.ones((1024, 1024), dtype=torch.float32, device=DEVICE)
+    assert t.sum().item() == pytest.approx(1024.0 * 1024.0)
+    del t
+    stats_cached = torch_iris.memory_stats()
+    assert stats_cached["cached_bytes"] >= 1024 * 1024 * 4
+    assert "cache_reclaims" in stats_cached
+    torch_iris.empty_cache()
+    assert torch_iris.memory_stats()["cached_bytes"] == 0
+
+
+def test_parity_scopes_have_zero_cpu_fallbacks():
+    torch_iris.reset_fallback_stats()
+    torch_iris.set_cpu_fallback_enabled(True)
+
+    for case in SCOPE["cases"]:
+        compare(run_case(case, "iris:0"), run_case(case, "cpu"))
+    for case in TRAINING_SCOPE["cases"]:
+        compare(run_training_case(case, "iris:0"), run_training_case(case, "cpu"), TRAINING_SCOPE["tolerances"])
+    for case in OPERATOR_SCOPE["cases"]:
+        compare(run_operator_case(case, "iris:0"), run_operator_case(case, "cpu"), OPERATOR_SCOPE["tolerances"])
+
+    assert torch_iris.fallback_stats() == {}

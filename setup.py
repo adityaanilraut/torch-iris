@@ -14,8 +14,8 @@ setup(
     ext_modules=[
         CppExtension(
             "torch_iris._C",
-            sources=["csrc/backend.cpp", "csrc/opencl_runtime.cpp", "csrc/spatial.cpp", "csrc/ops_extra.cpp", "csrc/ops_phase3.cpp", "csrc/autocast.cpp"],
-            depends=["csrc/opencl_runtime.h", "csrc/rng_internal.h", "csrc/kernels.h", "csrc/spatial_kernels.h", "csrc/ops_kernels.h", "csrc/ops_phase3_kernels.h"],
+            sources=["csrc/backend.cpp", "csrc/opencl_runtime.cpp", "csrc/spatial.cpp", "csrc/ops_extra.cpp", "csrc/ops_phase3.cpp", "csrc/autocast.cpp", "csrc/fallback.cpp"],
+            depends=["csrc/opencl_runtime.h", "csrc/rng_internal.h", "csrc/fallback.h", "csrc/kernels.h", "csrc/spatial_kernels.h", "csrc/ops_kernels.h", "csrc/ops_phase3_kernels.h"],
             include_dirs=[str(root / "third_party" / "opencl")],
             define_macros=[("CL_TARGET_OPENCL_VERSION", "120")],
             extra_compile_args=["/std:c++20", "/O2"],
