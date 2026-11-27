@@ -53,6 +53,8 @@ def _cross(input, other, *, dim=-1):
 
 def _batch_add(reduce):
     def run(input, batch1, batch2, *, beta=1, alpha=1):
+        if input.device != batch1.device or input.device != batch2.device:
+            raise RuntimeError("batched matrix product expects operands on the same device")
         if input.dtype != batch1.dtype or input.dtype != batch2.dtype:
             raise RuntimeError("batched matrix product expects matching input dtypes")
         if (batch1.ndim != 3 or batch2.ndim != 3 or batch1.size(0) != batch2.size(0)
@@ -69,6 +71,35 @@ def _batch_add(reduce):
 
     return run
 
+
+_addbmm = _batch_add(True)
+
+
+def _addbmm_inplace(input, batch1, batch2, *, beta=1, alpha=1):
+    result = _addbmm(input, batch1, batch2, beta=beta, alpha=alpha)
+    if input.shape != result.shape:
+        raise RuntimeError("addbmm_ cannot change the destination shape")
+    return input.copy_(result)
+
+
+def _matmul_output_dtype(operation):
+    def run(*args, **kwargs):
+        *tensors, out_dtype = args
+        dtype = tensors[0].dtype
+        if any(tensor.device != tensors[0].device or tensor.dtype != dtype for tensor in tensors):
+            raise RuntimeError("matrix product expects operands with matching devices and dtypes")
+        if out_dtype == dtype:
+            return operation(*tensors, **kwargs)
+        if out_dtype != torch.float32 or dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError("Iris matrix products can widen float16 or bfloat16 inputs to float32")
+        return operation(*(tensor.float() for tensor in tensors), **kwargs)
+
+    return run
+
+
+def _addmm_activation(input, mat1, mat2, *, beta=1, alpha=1, use_gelu=False):
+    result = torch.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+    return torch.nn.functional.gelu(result) if use_gelu else result.relu()
 
 def _clamp_tensor(input, lower=None, upper=None):
     from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
@@ -128,12 +159,19 @@ def register(library):
     library.impl("clamp.Tensor", _clamp_tensor)
     library.impl("clamp.Tensor_out", _out(_clamp_tensor, "out"))
     library.impl("clamp_.Tensor", _clamp_tensor_inplace)
+    library.impl("addbmm_", _addbmm_inplace)
+    library.impl("dot.out", _out(torch.dot, "out"))
+    library.impl("_addmm_activation.out", _out(_addmm_activation, "out"))
+    for name in ("mm", "bmm", "addmm", "baddbmm"):
+        operation = _matmul_output_dtype(getattr(torch, name))
+        library.impl(f"{name}.dtype", operation)
+        library.impl(f"{name}.dtype_out", _out(operation, "out"))
     for name, overload, fn in (
         ("bucketize.Tensor", "bucketize.Tensor_out", _bucketize),
         ("bucketize.Scalar", "bucketize.Scalar_out", _bucketize),
         ("linalg_cross", "linalg_cross.out", _cross),
         ("baddbmm", "baddbmm.out", _batch_add(False)),
-        ("addbmm", "addbmm.out", _batch_add(True)),
+        ("addbmm", "addbmm.out", _addbmm),
         ("signbit", "signbit.out", _signbit),
         ("nan_to_num", "nan_to_num.out", _nan_to_num),
     ):

@@ -125,6 +125,11 @@ struct MatrixView {
 };
 void integer_matmul(cl_mem output, MatrixView left, MatrixView right, cl_ulong batches,
                     cl_ulong rows, cl_ulong columns, cl_ulong inner, ValueType type);
+bool supports_packed_int8_matmul();
+void packed_int8_matmul(cl_mem output, cl_ulong output_offset, MatrixView left, MatrixView right_transposed,
+                        cl_ulong rows, cl_ulong columns, cl_ulong inner);
+void strided_int8_matmul(cl_mem output, cl_ulong output_offset, MatrixView left, MatrixView right,
+                         cl_ulong rows, cl_ulong columns, cl_ulong inner);
 
 struct BufferSlice {
     cl_mem buffer = nullptr;

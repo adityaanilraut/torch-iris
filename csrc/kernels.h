@@ -765,6 +765,21 @@ __kernel void integral_matmul(
     write_integer(out, index, type, as_long(result));
 }
 
+__kernel void int8_matmul_strided(
+    __global int* out, __global const char* left, __global const char* right,
+    ulong output_offset, ulong columns, ulong inner, ulong a, ulong ar, ulong ac, ulong b, ulong br, ulong bc
+) {
+    const ulong row = get_global_id(1);
+    const ulong col = get_global_id(0);
+    a += row * ar;
+    b += col * bc;
+    uint sum = 0;
+    for (ulong k = 0; k < inner; ++k) {
+        sum += (uint)((int)left[a + k * ac] * (int)right[b + k * br]);
+    }
+    out[output_offset + row * columns + col] = as_int(sum);
+}
+
 __kernel void integer_binary(__global const ulong* geometry, __global uchar* output,
                              __global const uchar* left, __global const uchar* right,
                              ulong dst, ulong a, ulong b, ulong rank, uint input_type,
@@ -2699,5 +2714,51 @@ __kernel void linear_int4_gemv_sg16(
 #endif
 )CLC"
 };
+
+// Built separately with OpenCL C 3.0 on drivers exposing accelerated signed packed dot products.
+inline constexpr const char* int8_packed_kernels = R"CLC(
+__kernel __attribute__((reqd_work_group_size(8, 8, 1)))
+void int8_matmul_packed(__global int* out, __global const uint* left, __global const uint* right_transposed,
+                        ulong output_offset, ulong columns, ulong packs, ulong left_offset, ulong right_offset) {
+    const uint x = get_local_id(0);
+    const uint y = get_local_id(1);
+    const uint lane = y * 8 + x;
+    const ulong col = get_group_id(0) * 32;
+    const ulong row = get_group_id(1) * 32;
+    __local uint a_tile[16][33];
+    __local uint b_tile[16][33];
+    uint sums[4][4] = {{0}};
+
+    for (ulong k = 0; k < packs; k += 16) {
+        for (uint i = lane; i < 32 * 16; i += 64) {
+            const uint output = i / 16;
+            const uint pack = i % 16;
+            a_tile[pack][output] = left[left_offset + (row + output) * packs + k + pack];
+            b_tile[pack][output] = right_transposed[right_offset + (col + output) * packs + k + pack];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint pack = 0; pack < 16; ++pack) {
+            #pragma unroll
+            for (uint i = 0; i < 4; ++i) {
+                const uint a = a_tile[pack][y + i * 8];
+                #pragma unroll
+                for (uint j = 0; j < 4; ++j) {
+                    const uint b = b_tile[pack][x + j * 8];
+                    sums[i][j] += (uint)dot_4x8packed_ss_int(a, b);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    #pragma unroll
+    for (uint i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (uint j = 0; j < 4; ++j) {
+            out[output_offset + (row + y + i * 8) * columns + col + x + j * 8] = as_int(sums[i][j]);
+        }
+    }
+}
+)CLC";
 
 }  // namespace iris

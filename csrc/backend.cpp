@@ -2700,6 +2700,52 @@ MatrixView matrix_view(const at::Tensor& tensor) {
             static_cast<cl_ulong>(tensor.stride(-2)), static_cast<cl_ulong>(tensor.stride(-1))};
 }
 
+void check_int8_mm(const at::Tensor& left, const at::Tensor& right) {
+    check_mm(left, right);
+    TORCH_CHECK(left.scalar_type() == at::kChar, "Iris _int_mm requires signed int8 inputs");
+}
+
+void run_int8_mm(at::Tensor& out, const at::Tensor& left, const at::Tensor& right) {
+    const auto rows = left.size(0);
+    const auto columns = right.size(1);
+    const auto inner = left.size(1);
+    if (out.numel() == 0) return;
+    if (inner == 0) {
+        zero(out);
+        return;
+    }
+    if (rows % 32 == 0 && columns % 32 == 0 && inner % 64 == 0 &&
+        left.is_contiguous() && left.storage_offset() % 4 == 0 && supports_packed_int8_matmul()) {
+        const auto packed_right = right.transpose(0, 1).contiguous();
+        if (packed_right.storage_offset() % 4 == 0) {
+            packed_int8_matmul(buffer(out), out.storage_offset(), matrix_view(left), matrix_view(packed_right),
+                               rows, columns, inner);
+            return;
+        }
+    }
+    strided_int8_matmul(buffer(out), out.storage_offset(), matrix_view(left), matrix_view(right), rows, columns, inner);
+}
+
+at::Tensor int8_mm(const at::Tensor& left, const at::Tensor& right) {
+    check_int8_mm(left, right);
+    auto output = make_output({left.size(0), right.size(1)}, at::kInt);
+    run_int8_mm(output, left, right);
+    return output;
+}
+
+at::Tensor& int8_mm_out(const at::Tensor& left, const at::Tensor& right, at::Tensor& output) {
+    check_int8_mm(left, right);
+    check_device(output.device());
+    TORCH_CHECK(output.scalar_type() == at::kInt, "Iris _int_mm out must have dtype int32");
+    TORCH_CHECK(output.dim() == 2 && output.size(0) == left.size(0) && output.size(1) == right.size(1),
+                "Iris _int_mm out must already have the result shape");
+    TORCH_CHECK(output.is_contiguous(), "Iris _int_mm out must be contiguous");
+    at::assert_no_overlap(output, left);
+    at::assert_no_overlap(output, right);
+    run_int8_mm(output, left, right);
+    return output;
+}
+
 at::Tensor matmul_2d(const at::Tensor& left, const at::Tensor& right) {
     check_mm(left, right);
     const auto rows = left.size(0);
@@ -2724,6 +2770,13 @@ at::Tensor batched_mm(const at::Tensor& left, const at::Tensor& right) {
     auto output = make_output({batches, rows, columns}, left.scalar_type());
     run_typed_mm(output, left, right, batches, rows, columns, inner);
     return output;
+}
+
+template <auto multiply>
+at::Tensor& matmul_out(const at::Tensor& left, const at::Tensor& right, at::Tensor& output) {
+    check_device(output.device());
+    TORCH_CHECK(output.scalar_type() == left.scalar_type(), "Iris matmul out must match the input dtype");
+    return write_result(output, multiply(left, right));
 }
 
 at::Tensor iris_dot(const at::Tensor& left, const at::Tensor& right) {
@@ -2766,12 +2819,30 @@ std::tuple<at::Tensor, at::Tensor> matmul_backward(
 at::Tensor addmm(
     const at::Tensor& bias, const at::Tensor& left, const at::Tensor& right,
     const at::Scalar& beta, const at::Scalar& alpha) {
-    check_operand(bias);
+    check_device(bias.device());
     check_mm(left, right);
-    TORCH_CHECK(bias.scalar_type() == left.scalar_type(), "Iris addmm input dtypes must match");
+    const auto dtype = left.scalar_type();
+    TORCH_CHECK(bias.scalar_type() == dtype, "Iris addmm input dtypes must match");
     const at::DimVector sizes{left.size(0), right.size(1)};
     TORCH_CHECK(bias.dim() <= 2, "Iris addmm bias must broadcast into a 2-D result");
     const auto expanded = at::inferExpandGeometry_dimvector(bias.sizes(), bias.strides(), sizes);
+    if (dtype == at::kBFloat16) {
+        return iris::addmm(bias.to(at::kFloat), left.to(at::kFloat), right.to(at::kFloat), beta, alpha).to(dtype);
+    }
+    const bool integral = c10::isIntegralType(dtype, false);
+    if (integral || dtype == at::kComplexFloat) {
+        const auto bias_factor = integral ? at::Scalar(beta.toLong()) : beta;
+        const auto product_factor = integral ? at::Scalar(alpha.toLong()) : alpha;
+        const bool ignore_bias = bias_factor.equal(0);
+        if (!left.size(1) || product_factor.equal(0)) {
+            if (!ignore_bias) return bias.expand(sizes).mul(bias_factor).contiguous();
+            auto output = make_output(sizes, dtype);
+            return zero(output);
+        }
+        const auto product = matmul_2d(left, right).mul(product_factor);
+        return ignore_bias ? product : product.add(bias.mul(bias_factor));
+    }
+    check_tensor(bias);
     const auto bias_scale = beta.toFloat();
     const auto product_scale = alpha.toFloat();
     auto output = make_output(sizes, left.scalar_type());
@@ -2790,6 +2861,13 @@ at::Tensor addmm(
                     1, sizes[0], sizes[1], left.size(1), left.scalar_type() == at::kHalf,
                     bias_view, product_scale, bias_scale);
     return output;
+}
+
+at::Tensor& addmm_out(const at::Tensor& bias, const at::Tensor& left, const at::Tensor& right,
+                       const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& output) {
+    check_device(output.device());
+    TORCH_CHECK(output.scalar_type() == left.scalar_type(), "Iris addmm out must match the input dtype");
+    return write_result(output, iris::addmm(bias, left, right, beta, alpha));
 }
 
 at::Tensor iris_addmv(const at::Tensor& input, const at::Tensor& matrix, const at::Tensor& vector,
@@ -3599,10 +3677,15 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, library) {
         return write_result(output, iris_addmv(input, matrix, vector, beta, alpha));
     });
     library.impl("mm", &matmul_2d);
+    library.impl("mm.out", &matmul_out<matmul_2d>);
+    library.impl("_int_mm", &int8_mm);
+    library.impl("_int_mm.out", &int8_mm_out);
     library.impl("matmul", &matmul);
     library.impl("matmul_backward", &matmul_backward);
     library.impl("bmm", &batched_mm);
+    library.impl("bmm.out", &matmul_out<batched_mm>);
     library.impl("addmm", &addmm);
+    library.impl("addmm.out", &addmm_out);
     library.impl("sum", &sum_all);
     library.impl("sum.dim_IntList", &sum_dims);
     library.impl("nansum", &nansum_impl);

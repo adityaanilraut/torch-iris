@@ -232,6 +232,7 @@ struct Device {
     bool fp16;
     bool reqd_sg8;
     bool subgroups;
+    bool packed_signed_dot;
     cl_ulong max_allocation;
     cl_ulong total_memory;
     std::string driver_version;
@@ -288,6 +289,13 @@ Device find_device() {
                     std::string extensions(extension_size, '\0');
                     check(cl().clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, extensions.size(),
                                                extensions.data(), nullptr), "read GPU extensions");
+                    // CL_DEVICE_INTEGER_DOT_PRODUCT_ACCELERATION_PROPERTIES_4x8BIT_PACKED_KHR
+                    // is absent from the bundled OpenCL 1.2 headers. The first field is signed_accelerated.
+                    constexpr cl_device_info packed_dot_properties = 0x1075;
+                    cl_bool dot_acceleration[6]{};
+                    const bool packed_signed_dot = extensions.find("cl_khr_integer_dot_product") != std::string::npos &&
+                        cl().clGetDeviceInfo(device, packed_dot_properties, sizeof(dot_acceleration),
+                                             dot_acceleration, nullptr) == CL_SUCCESS && dot_acceleration[0];
                     cl_ulong max_alloc = 0;
                     cl_ulong total_mem = 0;
                     check(cl().clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc),
@@ -307,7 +315,7 @@ Device find_device() {
                     return {device, std::move(name), extensions.find("cl_khr_fp16") != std::string::npos,
                             extensions.find("cl_intel_required_subgroup_size") != std::string::npos,
                             extensions.find("cl_intel_subgroups") != std::string::npos,
-                            max_alloc, total_mem, std::move(drv_ver)};
+                            packed_signed_dot, max_alloc, total_mem, std::move(drv_ver)};
                 }
             }
         }
@@ -338,6 +346,7 @@ constexpr std::size_t matmul_tile_size = 16;
 constexpr std::size_t matmul_block_group_width = 8;
 constexpr std::size_t matmul_block_group_height = 16;
 constexpr std::size_t matmul_block_size = 64;
+constexpr char packed_int8_kernel_name[] = "int8_matmul_packed";
 constexpr std::size_t reduction_group_size = 64;
 
 struct MatmulTile {
@@ -804,7 +813,36 @@ public:
         });
     }
 
+    bool supports_packed_int8_matmul() {
+        if (!device().packed_signed_dot) return false;
+        const std::lock_guard lock(mutex_);
+        if (!packed_int8_supported_.has_value()) {
+            packed_int8_supported_ = build_packed_int8_kernel();
+        }
+        return *packed_int8_supported_;
+    }
+
 private:
+
+    bool build_packed_int8_kernel() {
+        const auto gpu = device().id;
+        cl_int status = CL_SUCCESS;
+        const char* source = int8_packed_kernels;
+        Program program(cl().clCreateProgramWithSource(context_.get(), 1, &source, nullptr, &status));
+        check(status, "create packed INT8 program");
+        status = cl().clBuildProgram(program.get(), 1, &gpu, "-cl-std=CL3.0", nullptr, nullptr);
+        if (is_oom_status(status)) check(status, "build packed INT8 program");
+        if (status != CL_SUCCESS) return false;
+        Kernel function(cl().clCreateKernel(program.get(), packed_int8_kernel_name, &status));
+        check(status, "create packed INT8 kernel");
+        std::size_t group_size = 0;
+        if (cl().clGetKernelWorkGroupInfo(function.get(), gpu, CL_KERNEL_WORK_GROUP_SIZE,
+                                         sizeof(group_size), &group_size, nullptr) != CL_SUCCESS || group_size < 64) {
+            return false;
+        }
+        kernels_.emplace(packed_int8_kernel_name, std::move(function));
+        return true;
+    }
 
     Queue make_queue() const {
         cl_int status = CL_SUCCESS;
@@ -1069,6 +1107,7 @@ private:
     std::vector<PendingTransfer> pending_;
     MemoryStats stats_;
     Program program_;
+    std::optional<bool> packed_int8_supported_;
     MatmulTile tiled_matmul_{
         "matmul_tiled", matmul_tile_size, matmul_tile_size, matmul_tile_size, matmul_tile_size,
         tiled_matmul_submissions_count};
@@ -1415,6 +1454,25 @@ void integer_matmul(cl_mem output, MatrixView left, MatrixView right, cl_ulong b
     runtime().run("integral_matmul", size, output, left.buffer, right.buffer,
                   rows, columns, inner, left.offset, left.batch_stride, left.row_stride, left.column_stride,
                   right.offset, right.batch_stride, right.row_stride, right.column_stride, static_cast<cl_uint>(type));
+}
+
+bool supports_packed_int8_matmul() {
+    return runtime().supports_packed_int8_matmul();
+}
+
+void packed_int8_matmul(cl_mem output, cl_ulong output_offset, MatrixView left, MatrixView right_transposed,
+                        cl_ulong rows, cl_ulong columns, cl_ulong inner) {
+    const std::size_t size[] = {columns / 4, rows / 4};
+    constexpr std::size_t local[] = {8, 8};
+    runtime().run_local(packed_int8_kernel_name, size, local, output, left.buffer, right_transposed.buffer,
+                        output_offset, columns, inner / 4, left.offset / 4, right_transposed.offset / 4);
+}
+
+void strided_int8_matmul(cl_mem output, cl_ulong output_offset, MatrixView left, MatrixView right,
+                         cl_ulong rows, cl_ulong columns, cl_ulong inner) {
+    const std::size_t size[] = {columns, rows};
+    runtime().run("int8_matmul_strided", size, output, left.buffer, right.buffer, output_offset, columns, inner,
+                  left.offset, left.row_stride, left.column_stride, right.offset, right.row_stride, right.column_stride);
 }
 
 void masked_copy(cl_mem output, cl_mem count, cl_mem input, cl_mem mask, cl_ulong length,

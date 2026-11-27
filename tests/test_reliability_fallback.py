@@ -85,6 +85,105 @@ def test_strict_gpu_only_mode_blocks_fallback():
     assert torch_iris.fallback_stats() == {}
 
 
+@pytest.mark.parametrize("rows,inner,cols,strided", [
+    (64, 128, 96, False), (11, 17, 9, True), (3, 0, 2, False), (0, 5, 2, False),
+])
+def test_native_int8_matmul(rows, inner, cols, strided):
+    torch_iris.set_cpu_fallback_enabled(False)
+    rng = torch.Generator().manual_seed(12)
+    step = 2 if strided else 1
+    left = torch.randint(-128, 128, (rows, inner * step), dtype=torch.int8, generator=rng)
+    right = torch.randint(-128, 128, (inner * step, cols), dtype=torch.int8, generator=rng)
+    expected = left[:, ::step].int() @ right[::step].int()
+    a, b = left.to(DEVICE)[:, ::step], right.to(DEVICE)[::step]
+    result = torch._int_mm(a, b)
+    assert result.device == DEVICE
+    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    storage = torch.full((expected.numel() + 2,), -1, device=DEVICE, dtype=torch.int32)
+    output = storage[1:-1].view(rows, cols)
+    assert torch._int_mm(a, b, out=output) is output
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert storage.cpu()[[0, -1]].tolist() == [-1, -1]
+    assert torch_iris.fallback_stats() == {}
+
+
+def test_native_int8_matmul_checks_out_contract():
+    torch_iris.set_cpu_fallback_enabled(False)
+    a = torch.ones((3, 5), dtype=torch.int8, device=DEVICE)
+    b = torch.ones((5, 2), dtype=torch.int8, device=DEVICE)
+    with pytest.raises(RuntimeError, match="int32"):
+        torch._int_mm(a, b, out=torch.empty((3, 2), dtype=torch.int64, device=DEVICE))
+    with pytest.raises(RuntimeError, match="result shape"):
+        torch._int_mm(a, b, out=torch.empty((0,), dtype=torch.int32, device=DEVICE))
+    with pytest.raises(RuntimeError, match="contiguous"):
+        torch._int_mm(a, b, out=torch.empty((2, 3), dtype=torch.int32, device=DEVICE).T)
+
+
+def test_native_matrix_product_overloads():
+    torch_iris.set_cpu_fallback_enabled(False)
+    a = torch.arange(-6, 6, dtype=torch.float32).reshape(3, 4) / 4
+    b = torch.arange(8, dtype=torch.float32).reshape(4, 2) / 4
+    a_batch, b_batch = a.expand(2, -1, -1).clone(), b.expand(2, -1, -1).clone()
+    product, batch_product = torch.mm(a, b), torch.bmm(a_batch, b_batch)
+    x, y, xb, yb = (tensor.to(DEVICE) for tensor in (a, b, a_batch, b_batch))
+    for operation, inputs, expected in (
+        (torch.mm, (x, y), product),
+        (torch.matmul, (x, y), product),
+        (torch.bmm, (xb, yb), batch_product),
+        (torch.matmul, (xb, yb), batch_product),
+        (torch.addmm, (product.to(DEVICE), x, y), 2 * product),
+        (torch.dot, (x[0], x[1]), torch.dot(a[0], a[1])),
+    ):
+        output = torch.empty_like(expected, device=DEVICE)
+        assert operation(*inputs, out=output) is output
+        torch.testing.assert_close(output.cpu(), expected)
+
+    destination = torch.zeros_like(product, device=DEVICE)
+    assert destination.addmm_(x, y) is destination
+    torch.testing.assert_close(destination.cpu(), product)
+    assert destination.addbmm_(xb, yb) is destination
+    torch.testing.assert_close(destination.cpu(), product + batch_product.sum(0))
+
+    activation = torch.ops.aten._addmm_activation
+    torch.testing.assert_close(activation(destination, x, y, use_gelu=True).cpu(),
+                               activation(destination.cpu(), a, b, use_gelu=True))
+    torch.testing.assert_close(torch.ops.aten.linear.out(x, y.T, out=destination).cpu(), product)
+    assert torch_iris.fallback_stats() == {}
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_native_matrix_products_with_float32_output(dtype):
+    torch_iris.set_cpu_fallback_enabled(False)
+    a = torch.arange(-6, 6, dtype=dtype).reshape(3, 4) / 4
+    b = torch.arange(8, dtype=dtype).reshape(4, 2) / 4
+    x, y = a.to(DEVICE), b.to(DEVICE)
+    bias = torch.ones((3, 2), device=DEVICE, dtype=dtype)
+    for operation, inputs, expected in (
+        (torch.mm, (x, y), a.float() @ b.float()),
+        (torch.bmm, (x[None], y[None]), (a.float() @ b.float())[None]),
+        (torch.addmm, (bias, x, y), 1 + a.float() @ b.float()),
+        (torch.baddbmm, (bias[None], x[None], y[None]), (1 + a.float() @ b.float())[None]),
+    ):
+        torch.testing.assert_close(operation(*inputs, out_dtype=torch.float32).cpu(), expected)
+        output = torch.empty_like(expected, device=DEVICE)
+        assert operation(*inputs, out_dtype=torch.float32, out=output) is output
+        torch.testing.assert_close(output.cpu(), expected)
+    assert torch_iris.fallback_stats() == {}
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.int32, torch.complex64])
+def test_native_addmm_input_dtypes(dtype):
+    torch_iris.set_cpu_fallback_enabled(False)
+    a = torch.arange(12).reshape(3, 4).to(dtype)
+    b = torch.arange(8).reshape(4, 2).to(dtype)
+    bias = torch.ones(2, dtype=dtype)
+    expected = torch.addmm(bias, a, b, alpha=2, beta=3)
+    actual = torch.addmm(bias.to(DEVICE), a.to(DEVICE), b.to(DEVICE), alpha=2, beta=3)
+    torch.testing.assert_close(actual.cpu(), expected)
+    assert torch_iris.fallback_stats() == {}
+
+
 def test_env_var_controls_in_fresh_subprocess():
     env_strict = os.environ.copy()
     env_strict["TORCH_IRIS_CPU_FALLBACK"] = "0"
