@@ -30,7 +30,7 @@ py -3.12 -m venv .venv-iris
 
 ### Option 2: Install the prebuilt wheel from GitHub Releases
 
-Download `torch_iris-0.16.1-cp312-cp312-win_amd64.whl` from the [GitHub Releases](https://github.com/adityaanilraut/torch-iris/releases/tag/v0.16.1) page, then run:
+Download `torch_iris-0.17.0-cp312-cp312-win_amd64.whl` from [GitHub Releases](https://github.com/adityaanilraut/torch-iris/releases/tag/v0.17.0) and install it with the CPU build of PyTorch.
 
 ```powershell
 py -3.12 -m venv .venv-iris
@@ -40,7 +40,7 @@ $iris = '.\.venv-iris\Scripts\python.exe'
 & $iris -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
 
 # 2. Install the torch-iris extension wheel
-& $iris -m pip install --no-deps .\torch_iris-0.16.1-cp312-cp312-win_amd64.whl
+& $iris -m pip install --no-deps .\torch_iris-0.17.0-cp312-cp312-win_amd64.whl
 ```
 
 ### Option 3: Build from source
@@ -56,7 +56,7 @@ $iris = '.\.venv-iris\Scripts\python.exe'
 & $iris -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
 & $iris -m pip install setuptools wheel
 & $iris -m pip wheel --no-build-isolation --no-deps --wheel-dir dist .
-& $iris -m pip install --force-reinstall --no-deps dist\torch_iris-0.16.1-cp312-cp312-win_amd64.whl
+& $iris -m pip install --force-reinstall --no-deps dist\torch_iris-0.17.0-cp312-cp312-win_amd64.whl
 ```
 
 ---
@@ -125,6 +125,23 @@ scaler.step(optimizer)
 scaler.update()
 ```
 
+### INT8 Matrix Multiplication
+
+`torch._int_mm` accepts two signed INT8 matrices on `iris:0` and returns an INT32 matrix on the GPU. The backend uses packed DP4a dot products for compatible layouts on drivers that expose them and a strided OpenCL kernel for other supported layouts. The `out=` variant accepts a contiguous INT32 Iris tensor with the result shape.
+
+```python
+import torch
+import torch_iris
+
+torch_iris.set_cpu_fallback_enabled(False)
+a = torch.randint(-128, 128, (64, 128), dtype=torch.int8).to("iris:0")
+b = torch.randint(-128, 128, (128, 96), dtype=torch.int8).to("iris:0")
+c = torch._int_mm(a, b)
+assert c.dtype == torch.int32 and c.device.type == "iris"
+```
+
+`torch.mm`, `torch.bmm`, `torch.addmm`, and `torch.baddbmm` also accept `out_dtype=torch.float32` with FP16 or BF16 inputs. The backend converts the operands on the GPU before multiplying.
+
 ### Zero-Copy DLPack Round Trips
 
 Use the package helpers for same-context Iris tensors:
@@ -179,7 +196,7 @@ Install `pytest` (and `torchvision` for vision tests) in your environment and ru
 & $iris -m pytest -p no:cacheprovider -q tests
 
 # Run standalone parity scopes against the built wheel
-$wheel = 'dist\torch_iris-0.16.1-cp312-cp312-win_amd64.whl'
+$wheel = 'dist\torch_iris-0.17.0-cp312-cp312-win_amd64.whl'
 foreach ($scope in 'forward', 'training', 'operators') {
     & $iris -m parity.run iris --scope $scope --wheel $wheel --output "parity-$scope.json"
 }

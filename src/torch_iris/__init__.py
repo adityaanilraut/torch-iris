@@ -1,6 +1,6 @@
 """Register Intel Iris Xe as a PyTorch device."""
 
-__version__ = "0.16.1"
+__version__ = "0.17.0"
 
 from contextlib import contextmanager
 import sys
