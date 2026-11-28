@@ -7,12 +7,16 @@ import torch
 import torch_iris
 
 
+HAS_FP16 = torch.float16 in torch_iris.get_amp_supported_dtype()
+
+
 class IrisTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not torch_iris.is_available():
-            raise RuntimeError("Tests require an available Intel Iris Xe OpenCL GPU")
+            raise unittest.SkipTest("Tests require an available Intel Iris Xe OpenCL GPU")
         assert "iris" in torch_iris.device_name().lower()
+        cls.subgroup_kernels = torch_iris.get_device_properties().subgroup_kernels
 
     def test_allocation_and_copy_directions(self):
         host = torch.arange(12, dtype=torch.float32).reshape(3, 4)[1:]
@@ -410,6 +414,7 @@ class IrisTests(unittest.TestCase):
                         print(value)
                     self.assertEqual(output.getvalue(), expected + "\n")
 
+    @unittest.skipUnless(HAS_FP16, "OpenCL FP16 is unavailable")
     def test_fp16_casts_storage_and_blocked_gemm(self):
         self.assertIn(torch.float16, torch_iris.get_amp_supported_dtype())
         random = torch.Generator().manual_seed(404)
@@ -601,10 +606,12 @@ class IrisTests(unittest.TestCase):
                 actual = torch.nn.functional.scaled_dot_product_attention(
                     iq, ik, iv, is_causal=causal, enable_gqa=gqa
                 )
-                self.assertEqual(torch_iris._C._kernel_submissions() - before, 1)
+                if self.subgroup_kernels:
+                    self.assertEqual(torch_iris._C._kernel_submissions() - before, 1)
                 torch.testing.assert_close(actual.cpu(), expected, rtol=1e-4, atol=1e-5, check_stride=True)
 
-    def test_fp16_sg8_gemm_and_nll_oob_recovery(self):
+    @unittest.skipUnless(HAS_FP16, "OpenCL FP16 is unavailable")
+    def test_fp16_sg8_gemm(self):
         random = torch.Generator().manual_seed(1002)
         for ta, tb in product((False, True), repeat=2):
             a = (torch.rand((256, 256), generator=random) - 0.5).half()
@@ -618,7 +625,8 @@ class IrisTests(unittest.TestCase):
             ref = torch.addmm(bias.float(), a.float(), b.float(), alpha=0.5, beta=-0.25).half()
             torch.testing.assert_close(out.cpu(), ref, rtol=2e-3, atol=2e-3, check_stride=True)
 
-        # Out-of-bounds target still raises IndexError on readback/sync and recovers cleanly
+    def test_nll_out_of_bounds_recovery(self):
+        # An out-of-bounds target raises on readback or synchronization.
         bad_logits = torch.zeros((4, 5), device="iris")
         bad_target = torch.tensor([0, 1, 5, 2], device="iris")
         with self.assertRaises(IndexError):
@@ -696,6 +704,8 @@ class IrisTests(unittest.TestCase):
                 ((1, 4, 2, 64, 64, 128), True),
             ]:
                 with self.subTest(dtype=dtype, shape=(B, Hq, Hkv, Lq, Lk, D), causal=causal):
+                    if dtype == torch.float16 and not HAS_FP16:
+                        self.skipTest("OpenCL FP16 is unavailable")
                     q = (torch.rand((B, Hq, Lq, D), generator=random) - 0.5).to(dtype).requires_grad_()
                     k = (torch.rand((B, Hkv, Lk, D), generator=random) - 0.5).to(dtype).requires_grad_()
                     v = (torch.rand((B, Hkv, Lk, D), generator=random) - 0.5).to(dtype).requires_grad_()
@@ -716,10 +726,12 @@ class IrisTests(unittest.TestCase):
                     out_i = torch.nn.functional.scaled_dot_product_attention(
                         iq, ik, iv, is_causal=causal, enable_gqa=gqa
                     )
-                    self.assertEqual(torch_iris._C._kernel_submissions() - before_fwd, 1)
+                    if self.subgroup_kernels:
+                        self.assertEqual(torch_iris._C._kernel_submissions() - before_fwd, 1)
                     before_bwd = torch_iris._C._kernel_submissions()
                     out_i.backward(go.to("iris"))
-                    self.assertLessEqual(torch_iris._C._kernel_submissions() - before_bwd, 4)
+                    if self.subgroup_kernels:
+                        self.assertLessEqual(torch_iris._C._kernel_submissions() - before_bwd, 4)
                     torch.testing.assert_close(out_i.cpu().float(), out_ref, rtol=rtol, atol=atol)
                     torch.testing.assert_close(iq.grad.cpu().float(), q_ref.grad, rtol=rtol * 2, atol=atol * 2)
                     torch.testing.assert_close(ik.grad.cpu().float(), k_ref.grad, rtol=rtol * 2, atol=atol * 2)
@@ -727,6 +739,10 @@ class IrisTests(unittest.TestCase):
 
         # FlashDecoding Split-KV (Lq=1..4, long Lk) & skinny GEMV (M=1..4)
         for dtype, rtol, atol in [(torch.float32, 2e-4, 2e-4), (torch.float16, 4e-3, 4e-3)]:
+            if dtype == torch.float16 and not HAS_FP16:
+                with self.subTest(dtype=dtype, workload="decode and GEMV"):
+                    self.skipTest("OpenCL FP16 is unavailable")
+                continue
             q = (torch.rand((1, 8, 1, 128), generator=random) - 0.5).to(dtype)
             k = (torch.rand((1, 2, 1024, 128), generator=random) - 0.5).to(dtype)
             v = (torch.rand((1, 2, 1024, 128), generator=random) - 0.5).to(dtype)
@@ -742,6 +758,7 @@ class IrisTests(unittest.TestCase):
             ref_mv = torch.nn.functional.linear(x.float(), w.float())
             torch.testing.assert_close(out_mv.cpu().float(), ref_mv, rtol=rtol * 2, atol=atol * 2)
 
+    @unittest.skipUnless(HAS_FP16, "OpenCL FP16 is unavailable")
     def test_native_fp16_ops_and_autocast(self):
         random = torch.Generator().manual_seed(1102)
         x = (torch.rand((2, 16, 12, 12), generator=random) - 0.5).half()
@@ -795,6 +812,10 @@ class IrisTests(unittest.TestCase):
     def test_weight_only_int8_int4_linear(self):
         random = torch.Generator().manual_seed(1103)
         for dtype, rtol, atol in [(torch.float32, 2e-4, 2e-4), (torch.float16, 4e-3, 4e-3)]:
+            if dtype == torch.float16 and not HAS_FP16:
+                with self.subTest(dtype=dtype):
+                    self.skipTest("OpenCL FP16 is unavailable")
+                continue
             for symmetric in (True, False):
                 x = (torch.rand((4, 256), generator=random) - 0.5).to(dtype)
                 w = (torch.rand((128, 256), generator=random) - 0.5) * 0.4
@@ -937,10 +958,13 @@ class IrisTests(unittest.TestCase):
                 yc = m_c(x_img)
                 yi = m_i(x_img.to("iris"))
                 torch.testing.assert_close(yi.cpu(), yc, rtol=2e-3, atol=2e-3)
-                with torch.autocast("iris", dtype=torch.float16):
-                    yac = m_i(x_img.to("iris"))
-                self.assertEqual(yac.shape, yc.shape)
-                self.assertTrue(torch.isfinite(yac.cpu()).all())
+                with self.subTest(model=type(m_i).__name__, dtype=torch.float16):
+                    if not HAS_FP16:
+                        self.skipTest("OpenCL FP16 is unavailable")
+                    with torch.autocast("iris", dtype=torch.float16):
+                        yac = m_i(x_img.to("iris"))
+                    self.assertEqual(yac.shape, yc.shape)
+                    self.assertTrue(torch.isfinite(yac.cpu()).all())
 
         # 2. UNet encoder-decoder (Conv2d + GroupNorm + Mish + ConvTranspose2d + Upsample + skip cat)
         class MiniUNet(torch.nn.Module):

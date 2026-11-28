@@ -12,7 +12,7 @@ DEVICE = torch.device("iris:0")
 
 
 @pytest.mark.parametrize("stride,padding", [(1, (1, 1)), (2, (0, 1))])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float32, pytest.param(torch.float16, marks=pytest.mark.requires_fp16)])
 def test_depthwise_3x3_strided_inputs_and_gradients(stride, padding, dtype):
     g = torch.Generator().manual_seed(772)
     host = [torch.randn(shape, generator=g).to(dtype) / 4 for shape in ((3, 5, 11, 30), (5, 1, 3, 3), (6,))]

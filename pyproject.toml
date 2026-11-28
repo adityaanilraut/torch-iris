@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-iris"
-version = "0.17.0"
+version = "0.18.0"
 description = "OpenCL PyTorch backend extension for Intel Iris Xe GPUs on 64-bit Windows"
 readme = "README.md"
 license = "Apache-2.0"

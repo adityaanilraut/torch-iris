@@ -1143,11 +1143,28 @@ at::Tensor pointwise_binary(const at::Tensor& left, const at::Tensor& right) {
     return binary_strided(op, left, right, 1.0f);
 }
 
-template <Elementwise op, IntegerOperation int_op>
+at::Tensor complex_unary_tensor(const at::Tensor& input, ComplexUnary op, at::ScalarType dtype) {
+    TORCH_CHECK(input.layout() == c10::kStrided, "Iris operations require strided tensors");
+    auto output = make_output(input.sizes(), dtype);
+    if (output.numel()) {
+        const auto source = input.resolve_conj().contiguous();
+        iris::complex_unary(op, buffer(output), buffer(source), source.numel(), source.storage_offset());
+    }
+    return output;
+}
+
+template <Elementwise op, IntegerOperation int_op, ComplexUnary complex_op = ComplexUnary::None>
 at::Tensor typed_unary(const at::Tensor& input) {
     check_device(input.device());
     const auto type = input.scalar_type();
     if (supported_float(type)) return unary_strided(op, input);
+    if (type == at::kBFloat16) return unary_strided(op, input.to(at::kFloat)).to(type);
+    if constexpr (complex_op != ComplexUnary::None) {
+        if (type == at::kComplexFloat) {
+            return complex_unary_tensor(input, complex_op,
+                                        complex_op == ComplexUnary::Abs ? at::kFloat : type);
+        }
+    }
     return integral_binary(input, input, type, type, int_op, 1);
 }
 
@@ -1170,9 +1187,33 @@ at::Tensor& typed_unary_inplace(at::Tensor& input) {
     return input;
 }
 
+at::Tensor abs_tensor(const at::Tensor& input) {
+    return typed_unary<Elementwise::Abs, IntegerOperation::Abs, ComplexUnary::Abs>(input);
+}
+
+at::Tensor& abs_out(const at::Tensor& input, at::Tensor& output) {
+    if (!input.is_complex()) return typed_unary_out<abs_tensor, Elementwise::Abs>(input, output);
+    check_device(output.device());
+    TORCH_CHECK(c10::canCast(at::kFloat, output.scalar_type()),
+                "Iris complex abs requires a floating-point or complex output");
+    at::assert_no_internal_overlap(output);
+    const auto result = abs_tensor(input);
+    at::native::resize_output(output, result.sizes());
+    copy_tensor(output, result);
+    return output;
+}
+
+at::Tensor& abs_inplace(at::Tensor& input) {
+    TORCH_CHECK(!input.is_complex(), "In-place abs is not supported for complex tensors.");
+    return typed_unary_inplace<abs_tensor, Elementwise::Abs>(input);
+}
+
 at::Tensor round_decimals(const at::Tensor& input, int64_t decimals) {
     check_device(input.device());
-    if (!supported_float(input.scalar_type())) return input.clone();
+    if (input.scalar_type() == at::kBFloat16) {
+        return round_decimals(input.to(at::kFloat), decimals).to(at::kBFloat16);
+    }
+    TORCH_CHECK(supported_float(input.scalar_type()), "Iris round with decimals requires a real floating dtype");
     auto output = make_output(input.sizes(), input.scalar_type());
     const auto scale = std::pow(10.0f, std::abs(static_cast<float>(decimals)));
     run_strided(Elementwise::RoundDecimals, output, input, input, scale, decimals >= 0 ? 1.0f : 0.0f);
@@ -1181,7 +1222,13 @@ at::Tensor round_decimals(const at::Tensor& input, int64_t decimals) {
 
 at::Tensor round_tensor(const at::Tensor& input) {
     check_device(input.device());
-    return supported_float(input.scalar_type()) ? unary_strided(Elementwise::Round, input) : input.clone();
+    const auto type = input.scalar_type();
+    if (type == at::kBFloat16) {
+        return unary_strided(Elementwise::Round, input.to(at::kFloat)).to(type);
+    }
+    if (c10::isIntegralType(type, false)) return input.clone();
+    TORCH_CHECK(supported_float(type), "Iris round requires a real floating or integer dtype");
+    return unary_strided(Elementwise::Round, input);
 }
 
 at::Tensor& round_decimals_out(const at::Tensor& input, int64_t decimals, at::Tensor& output) {
@@ -1332,10 +1379,32 @@ at::Tensor make_mask(const at::Tensor& left, const at::Tensor& right) {
 
 template <Elementwise op>
 at::Tensor predicate(const at::Tensor& input) {
+    check_device(input.device());
+    const auto dtype = input.scalar_type();
+    if (dtype == at::kBFloat16) return predicate<op>(input.to(at::kFloat));
+    if (dtype == at::kComplexFloat) {
+        constexpr auto complex_op = op == Elementwise::IsNan ? ComplexUnary::IsNan
+            : op == Elementwise::IsFinite ? ComplexUnary::IsFinite : ComplexUnary::IsInf;
+        return complex_unary_tensor(input, complex_op, at::kBool);
+    }
+    if (c10::isIntegralType(dtype, true)) {
+        auto output = make_output(input.sizes(), at::kBool);
+        return fill_scalar(output, op == Elementwise::IsFinite);
+    }
     check_operand(input);
     auto output = make_mask(input, input);
     run_strided(op, output, input, input);
     return output;
+}
+
+at::Tensor& isnan_out(const at::Tensor& input, at::Tensor& out) {
+    check_device(out.device());
+    TORCH_CHECK(out.scalar_type() == at::kBool, "Iris isnan out requires a bool tensor");
+    at::assert_no_internal_overlap(out);
+    const auto result = predicate<Elementwise::IsNan>(input);
+    at::native::resize_output(out, result.sizes());
+    copy_tensor(out, result);
+    return out;
 }
 
 template <Elementwise op>
@@ -1471,12 +1540,8 @@ at::Tensor& logical_not_out(const at::Tensor& input, at::Tensor& out) {
 }
 
 at::Tensor neg_tensor(const at::Tensor& input) {
-    check_device(input.device());
-    if (supported_float(input.scalar_type())) {
-        return unary_strided(Elementwise::Neg, input);
-    }
     TORCH_CHECK(input.scalar_type() != at::kBool, "Negation, the `-` operator, on a bool tensor is not supported.");
-    return integral_binary(input, input, input.scalar_type(), input.scalar_type(), IntegerOperation::Neg, 1);
+    return typed_unary<Elementwise::Neg, IntegerOperation::Neg, ComplexUnary::Neg>(input);
 }
 
 at::Tensor& neg_inplace(at::Tensor& input) {
@@ -1490,11 +1555,7 @@ at::Tensor& neg_inplace(at::Tensor& input) {
 }
 
 at::Tensor& neg_out(const at::Tensor& input, at::Tensor& out) {
-    check_device(out.device());
-    auto res = neg_tensor(input);
-    at::native::resize_output(out, res.sizes());
-    copy_tensor(out, res);
-    return out;
+    return typed_unary_out<neg_tensor, Elementwise::Neg>(input, out);
 }
 
 at::Tensor sub_scalar(const at::Tensor& input, const at::Scalar& other, const at::Scalar& alpha) {
@@ -1594,6 +1655,20 @@ at::Tensor divide_tensor(const at::Tensor& left, const at::Tensor& right) {
     TORCH_CHECK(is_iris(right) || (right.device().is_cpu() && right.dim() == 0), "Expected an Iris tensor or CPU scalar");
     const auto device = is_iris(left) ? left.device() : right.device();
     const auto dtype = at::result_type(left, right);
+    if (dtype == at::kComplexFloat) {
+        const auto a = left.to(device, dtype).resolve_conj();
+        const auto b = right.to(device, dtype).resolve_conj();
+        auto output = make_output(at::infer_size(a.sizes(), b.sizes()), dtype);
+        if (output.numel()) {
+            const auto geometry = elementwise_geometry(output, a, b);
+            complex_division(buffer(output), buffer(a), buffer(b), output.numel(),
+                             a.storage_offset(), b.storage_offset(), geometry);
+        }
+        return output;
+    }
+    if (dtype == at::kBFloat16) {
+        return divide_tensor(left.to(device, at::kFloat), right.to(device, at::kFloat)).to(dtype);
+    }
     const auto promoted = c10::isIntegralType(dtype, true) ? c10::get_default_dtype_as_scalartype() : dtype;
     TORCH_CHECK(supported_float(promoted), "Iris division requires a float32 or float16 result");
     if (right.device().is_cpu() && right.dim() == 0) {
@@ -3438,9 +3513,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, library) {
     IRIS_REGISTER_UNARY("ceil", Ceil);
     IRIS_REGISTER_UNARY("floor", Floor);
     IRIS_REGISTER_UNARY("trunc", Trunc);
-    library.impl("abs", &typed_unary<Elementwise::Abs, IntegerOperation::Abs>);
-    library.impl("abs_", &typed_unary_inplace<typed_unary<Elementwise::Abs, IntegerOperation::Abs>, Elementwise::Abs>);
-    library.impl("abs.out", &typed_unary_out<typed_unary<Elementwise::Abs, IntegerOperation::Abs>, Elementwise::Abs>);
+    library.impl("abs", &abs_tensor);
+    library.impl("abs_", &abs_inplace);
+    library.impl("abs.out", &abs_out);
     IRIS_REGISTER_UNARY("sqrt", Sqrt);
     IRIS_REGISTER_UNARY("rsqrt", Rsqrt);
     IRIS_REGISTER_UNARY("exp", Exp);
@@ -3472,9 +3547,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, library) {
     library.impl("sign", &typed_unary<Elementwise::Sign, IntegerOperation::Sign>);
     library.impl("sign_", &typed_unary_inplace<typed_unary<Elementwise::Sign, IntegerOperation::Sign>, Elementwise::Sign>);
     library.impl("sign.out", &typed_unary_out<typed_unary<Elementwise::Sign, IntegerOperation::Sign>, Elementwise::Sign>);
-    library.impl("sgn", &typed_unary<Elementwise::Sign, IntegerOperation::Sign>);
-    library.impl("sgn_", &typed_unary_inplace<typed_unary<Elementwise::Sign, IntegerOperation::Sign>, Elementwise::Sign>);
-    library.impl("sgn.out", &typed_unary_out<typed_unary<Elementwise::Sign, IntegerOperation::Sign>, Elementwise::Sign>);
+    library.impl("sgn", &typed_unary<Elementwise::Sign, IntegerOperation::Sign, ComplexUnary::Sgn>);
+    library.impl("sgn_", &typed_unary_inplace<typed_unary<Elementwise::Sign, IntegerOperation::Sign, ComplexUnary::Sgn>, Elementwise::Sign>);
+    library.impl("sgn.out", &typed_unary_out<typed_unary<Elementwise::Sign, IntegerOperation::Sign, ComplexUnary::Sgn>, Elementwise::Sign>);
     library.impl("round", &round_tensor);
     library.impl("round_", &typed_unary_inplace<round_tensor, Elementwise::Round>);
     library.impl("round.out", &typed_unary_out<round_tensor, Elementwise::Round>);
@@ -3523,6 +3598,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, library) {
 #undef IRIS_REGISTER_COMPARE
     library.impl("isfinite", &predicate<Elementwise::IsFinite>);
     library.impl("isnan", &predicate<Elementwise::IsNan>);
+    library.impl("isnan.out", &isnan_out);
     library.impl("isinf", &predicate<Elementwise::IsInf>);
     library.impl("bitwise_and.Tensor", &bool_and);
     library.impl("bitwise_and.Scalar", &bitwise_scalar<IntegerOperation::BitwiseAnd>);
@@ -3750,9 +3826,14 @@ at::Tensor linear_quant_op(
     const auto sc_c = scales.contiguous();
     at::DimVector out_shape(x.sizes());
     out_shape.back() = n;
-    const int64_t m = x_c.numel() / k;
     auto output = make_output(out_shape, x.scalar_type());
     if (output.numel()) {
+        if (!k) {
+            if (b_c.defined()) copy_tensor(output, b_c);
+            else zero(output);
+            return output;
+        }
+        const int64_t m = x_c.numel() / k;
         const auto to_slice = [](const at::Tensor& t) -> BufferSlice {
             if (!t.defined()) return {};
             return {buffer(t), static_cast<cl_ulong>(t.storage_offset())};
@@ -3814,6 +3895,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         output["total_memory"] = properties.total_memory;
         output["max_allocation"] = properties.max_allocation;
         output["double_fp_config"] = properties.double_fp_config;
+        output["subgroup_sizes"] = properties.subgroup_sizes;
+        output["fp16"] = properties.fp16;
+        output["subgroup_kernels"] = properties.subgroup_kernels;
+        output["packed_signed_dot"] = properties.packed_signed_dot;
+        output["optional_features_masked"] = properties.optional_features_masked;
         output["host_unified_memory"] = properties.host_unified_memory == CL_TRUE;
         output["compute_units"] = properties.compute_units;
         output["opencl_version"] = properties.opencl_version;

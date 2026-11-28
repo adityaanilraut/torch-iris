@@ -269,6 +269,22 @@ def fp16_operators(device):
     )
 
 
+def bfloat16_unary(device):
+    x = torch.tensor([-0., -2., 3., float("inf"), float("nan")], dtype=torch.bfloat16, device=device)
+    return snapshot(abs=x.abs(), sgn=x.sgn(), neg=x.neg(), isnan=x.isnan(),
+                    isfinite=x.isfinite(), isinf=x.isinf())
+
+
+def complex64_unary(device):
+    source = [0j, -2 + 3j, 4 - 5j, complex(float("inf"), 1), complex(1, float("nan"))]
+    x = torch.tensor(source, dtype=torch.complex64, device=device)
+    differentiable = x[:3].detach().requires_grad_()
+    gradient = torch.full_like(differentiable, .5 + 1j)
+    grad, = torch.autograd.grad(differentiable.sgn(), differentiable, gradient)
+    return snapshot(abs=x.abs(), sgn=torch.view_as_real(x.sgn()), neg=torch.view_as_real(x.neg()),
+                    isnan=x.isnan(), isfinite=x.isfinite(), isinf=x.isinf(), grad=torch.view_as_real(grad))
+
+
 def streamed_transfers(device):
     if device.type == "cpu":
         return snapshot(value=fixture(32, 41) + 0.125)

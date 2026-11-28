@@ -25,6 +25,7 @@ data/
 *.pt
 *.pth
 parity-*.json
+/parity/inventory-v*.json
 capability-runs/
 
 # Editors & OS

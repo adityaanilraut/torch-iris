@@ -47,7 +47,8 @@ def test_integer_clamp_and_one_hot_pipeline():
 
 
 @pytest.mark.parametrize("mode", ["floor", "trunc"])
-@pytest.mark.parametrize("dtype", [torch.int64, torch.int32, torch.float32, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32, torch.float32,
+                                  pytest.param(torch.float16, marks=pytest.mark.requires_fp16)])
 def test_rounded_division(mode, dtype):
     inputs = torch.tensor([[-11, 11, -6, 6], [9, -9, -1, 1]], dtype=dtype).T
     divisors = torch.tensor([-3, 2], dtype=dtype)
@@ -247,6 +248,43 @@ def test_fft2_and_stft():
         result = torch.stft(t, 8, hop_length=2, window=torch.hann_window(8, device=t.device), return_complex=True)
         return torch.view_as_real(result)
     compare_backward(stft, x, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"decimals": 0}, {"decimals": 1}, {"decimals": -1}])
+def test_bfloat16_round(kwargs):
+    host = torch.tensor([[1.75, -1.25, .5, -.5], [2.5, 15., float("inf"), float("nan")]],
+                        dtype=torch.bfloat16).T
+    expected = host.round(**kwargs)
+    iris = host.to("iris")
+    out = torch.empty_like(iris)
+    assert torch.round(iris, out=out, **kwargs) is out
+    for actual in (out, iris.round(**kwargs), iris.round_(**kwargs)):
+        check(expected, actual, rtol=0, atol=0)
+        zeros = expected == 0
+        torch.testing.assert_close(actual.cpu()[zeros].signbit(), expected[zeros].signbit())
+
+
+def test_round_dtype_contract():
+    x = torch.tensor([2**54 + 1], device="iris")
+    check(torch.tensor([2**54 + 1]), x.round())
+    with pytest.raises(RuntimeError):
+        x.round(decimals=-1)
+    for dtype in (torch.bool, torch.complex64):
+        with pytest.raises(RuntimeError):
+            x.to(dtype).round()
+
+
+@pytest.mark.parametrize("batch,width", [(2, 2), (2, 3)])
+def test_linalg_solve_batched_rhs(batch, width):
+    matrix = torch.eye(width).repeat(batch, 1, 1)
+    matrix[:, 0, -1] = .5
+    rhs = torch.arange(1, batch * width + 1, dtype=torch.float32).reshape(width, batch).T
+    for b in (rhs, rhs.unsqueeze(-1), rhs[0], torch.ones(width, width + 1)):
+        compare_backward(torch.linalg.solve, matrix, b)
+    device = matrix.to("iris")
+    check(torch.linalg.inv(matrix), torch.linalg.inv(device))
+    with pytest.raises(RuntimeError):
+        torch.linalg.solve(device, rhs.to("iris"), left=False)
 
 
 def test_linalg_factor_orientation_and_solve():
