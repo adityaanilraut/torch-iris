@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -231,12 +232,25 @@ struct Device {
     std::string name;
     bool fp16;
     bool reqd_sg8;
-    bool subgroups;
+    bool mixed_width_subgroups;
     bool packed_signed_dot;
+    bool optional_features_masked;
     cl_ulong max_allocation;
     cl_ulong total_memory;
     std::string driver_version;
+    std::vector<std::size_t> subgroup_sizes;
 };
+
+std::vector<std::size_t> query_subgroup_sizes(cl_device_id id) {
+    // CL_DEVICE_SUB_GROUP_SIZES_INTEL from cl_intel_required_subgroup_size.
+    constexpr cl_device_info parameter = 0x4108;
+    std::size_t bytes = 0;
+    if (cl().clGetDeviceInfo(id, parameter, 0, nullptr, &bytes) != CL_SUCCESS ||
+        !bytes || bytes % sizeof(std::size_t)) return {};
+    std::vector<std::size_t> sizes(bytes / sizeof(std::size_t));
+    if (cl().clGetDeviceInfo(id, parameter, bytes, sizes.data(), nullptr) != CL_SUCCESS) return {};
+    return sizes;
+}
 
 Device find_device() {
     cl_uint platform_count = 0;
@@ -289,11 +303,26 @@ Device find_device() {
                     std::string extensions(extension_size, '\0');
                     check(cl().clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, extensions.size(),
                                                extensions.data(), nullptr), "read GPU extensions");
+                    if (!extensions.empty() && extensions.back() == '\0') extensions.pop_back();
+                    extensions = " " + extensions + " ";
+                    const auto supports = [&](const std::string& token) {
+                        return extensions.find(" " + token + " ") != std::string::npos;
+                    };
+                    auto widths = supports("cl_intel_required_subgroup_size")
+                        ? query_subgroup_sizes(device) : std::vector<std::size_t>{};
+                    const bool sg8 = std::find(widths.begin(), widths.end(), 8) != widths.end();
+                    const bool sg16 = std::find(widths.begin(), widths.end(), 16) != widths.end();
+                    // CL_DEVICE_HALF_FP_CONFIG from cl_ext.h.
+                    constexpr cl_device_info half_fp_config = 0x1033;
+                    cl_device_fp_config half_config = 0;
+                    const bool fp16 = supports("cl_khr_fp16") &&
+                        cl().clGetDeviceInfo(device, half_fp_config, sizeof(half_config),
+                                             &half_config, nullptr) == CL_SUCCESS && half_config;
                     // CL_DEVICE_INTEGER_DOT_PRODUCT_ACCELERATION_PROPERTIES_4x8BIT_PACKED_KHR
                     // is absent from the bundled OpenCL 1.2 headers. The first field is signed_accelerated.
                     constexpr cl_device_info packed_dot_properties = 0x1075;
                     cl_bool dot_acceleration[6]{};
-                    const bool packed_signed_dot = extensions.find("cl_khr_integer_dot_product") != std::string::npos &&
+                    const bool packed_signed_dot = supports("cl_khr_integer_dot_product") &&
                         cl().clGetDeviceInfo(device, packed_dot_properties, sizeof(dot_acceleration),
                                              dot_acceleration, nullptr) == CL_SUCCESS && dot_acceleration[0];
                     cl_ulong max_alloc = 0;
@@ -312,10 +341,13 @@ Device find_device() {
                             drv_ver.pop_back();
                         }
                     }
-                    return {device, std::move(name), extensions.find("cl_khr_fp16") != std::string::npos,
-                            extensions.find("cl_intel_required_subgroup_size") != std::string::npos,
-                            extensions.find("cl_intel_subgroups") != std::string::npos,
-                            packed_signed_dot, max_alloc, total_mem, std::move(drv_ver)};
+                    // The shared subgroup source contains kernels requiring both widths.
+                    const char* feature_mask = std::getenv("TORCH_IRIS_MASK_OPTIONAL_FEATURES");
+                    const bool masked = feature_mask && std::string_view(feature_mask) == "1";
+                    return {device, std::move(name), fp16 && !masked, sg8 && !masked,
+                            sg8 && sg16 && supports("cl_intel_subgroups") && !masked,
+                            packed_signed_dot && !masked, masked,
+                            max_alloc, total_mem, std::move(drv_ver), std::move(widths)};
                 }
             }
         }
@@ -706,7 +738,7 @@ public:
         submit("matmul", [&](cl_command_queue queue) {
             if (batches == 1 && rows <= 16 && inner >= 64) {
                 const cl_uint is_half = fp16 ? 1u : 0u;
-                if (device().subgroups && device().reqd_sg8 && rows == 1 && left.column_stride == 1 &&
+                if (device().mixed_width_subgroups && rows == 1 && left.column_stride == 1 &&
                     right.row_stride == 1 && columns >= 256) {
                     const std::size_t col_groups = ((columns + 3) / 4 + 7) / 8;
                     const std::size_t size[] = {col_groups * 16, 8, 1};
@@ -722,7 +754,7 @@ public:
                     }
                     return status;
                 }
-                if (device().subgroups && device().reqd_sg8 && rows <= 8 && left.column_stride == 1 &&
+                if (device().mixed_width_subgroups && rows <= 8 && left.column_stride == 1 &&
                     right.row_stride == 1 && (rows * columns > 256 || columns >= 256)) {
                     const std::size_t col_groups = (columns + 7) / 8;
                     const std::size_t size[] = {col_groups * 16, 8, 1};
@@ -738,7 +770,7 @@ public:
                     }
                     return status;
                 }
-                if (device().subgroups && device().reqd_sg8 && rows <= 8 && left.column_stride == 1 &&
+                if (device().mixed_width_subgroups && rows <= 8 && left.column_stride == 1 &&
                     right.column_stride == 1 && columns >= 64) {
                     const std::size_t col_groups = (columns + 15) / 16;
                     const std::size_t size[] = {col_groups * 16, 8, 1};
@@ -768,7 +800,7 @@ public:
                             tiled_matmul_submissions_count.fetch_add(1, std::memory_order_relaxed);
                         }
                         return status;
-                    } else if (device().subgroups && device().reqd_sg8) {
+                    } else if (device().mixed_width_subgroups) {
                         const std::size_t col_groups = (columns + 7) / 8;
                         const std::size_t size[] = {col_groups * 16, rows * 8, 1};
                         constexpr std::size_t local[] = {16, 8, 1};
@@ -1053,7 +1085,7 @@ private:
             if (device().reqd_sg8) {
                 options += " -DIRIS_HAS_REQD_SG8=1";
             }
-            if (device().subgroups) {
+            if (device().mixed_width_subgroups) {
                 options += " -DIRIS_HAS_SUBGROUPS=1";
             }
             status = cl().clBuildProgram(program.get(), 1, &gpu, options.c_str(), nullptr, nullptr);
@@ -1163,7 +1195,7 @@ bool has_fp16() noexcept {
 
 bool has_subgroups() noexcept {
     try {
-        return device().subgroups && device().reqd_sg8;
+        return device().mixed_width_subgroups;
     } catch (...) {
         return false;
     }
@@ -1403,6 +1435,20 @@ void strided_elementwise(
         output, left, right, length, output_offset, left_offset, right_offset,
         static_cast<cl_ulong>(geometry.size() / 4), alpha, beta, static_cast<cl_uint>(op),
         static_cast<cl_uint>(fp16));
+}
+
+void complex_unary(ComplexUnary op, cl_mem output, cl_mem input,
+                   cl_ulong length, cl_ulong input_offset) {
+    if (!length) return;
+    const std::size_t size[] = {static_cast<std::size_t>(length)};
+    runtime().run("complex_unary", size, output, input, input_offset, static_cast<cl_uint>(op));
+}
+
+void complex_division(cl_mem output, cl_mem left, cl_mem right, cl_ulong length,
+                      cl_ulong left_offset, cl_ulong right_offset, std::span<const cl_ulong> geometry) {
+    runtime().run_with_geometry("complex_division", length, nullptr, geometry,
+                                output, left, right, left_offset, right_offset,
+                                static_cast<cl_ulong>(geometry.size() / 4));
 }
 
 void typed_copy(cl_mem output, cl_mem input, cl_ulong length, cl_ulong output_offset,
@@ -2253,7 +2299,20 @@ void linear_quant_forward(cl_mem output, BufferSlice x, BufferSlice qweight, Buf
                           cl_int m, cl_int n, cl_int k, cl_int group_size, cl_int num_groups,
                           bool x_fp16, bool sc_fp16, bool is_int4) {
     if (!m || !n || !k) return;
-    TORCH_CHECK(has_subgroups(), "Iris quantized linear requires OpenCL subgroup support");
+    const auto x_half = static_cast<cl_int>(x_fp16);
+    const auto scales_half = static_cast<cl_int>(sc_fp16);
+    const auto has_zeros = static_cast<cl_int>(zeros.buffer != nullptr);
+    const auto has_bias = static_cast<cl_int>(bias.buffer != nullptr);
+    // A vector read cannot share one scale if it crosses a quantization group.
+    if (!has_subgroups() || group_size % 4 != 0) {
+        const std::size_t size[] = {static_cast<std::size_t>(n), static_cast<std::size_t>(m)};
+        runtime().run("linear_quant_portable", size,
+                      output, x.buffer, qweight.buffer, scales.buffer, zeros.buffer, bias.buffer,
+                      x.offset, qweight.offset, scales.offset, zeros.offset, bias.offset,
+                      n, k, group_size, num_groups, x_half, scales_half, has_zeros, has_bias,
+                      static_cast<cl_int>(is_int4));
+        return;
+    }
     const std::size_t n_groups = (static_cast<std::size_t>(n) + 7) / 8;
     const std::size_t m_groups = (static_cast<std::size_t>(m) + 3) / 4;
     const std::size_t size[] = {n_groups * 16, m_groups * 8};
@@ -2262,10 +2321,7 @@ void linear_quant_forward(cl_mem output, BufferSlice x, BufferSlice qweight, Buf
                         output, x.buffer, qweight.buffer, scales.buffer, zeros.buffer, bias.buffer,
                         x.offset, qweight.offset, scales.offset, zeros.offset, bias.offset,
                         m, n, k, group_size, num_groups,
-                        static_cast<cl_int>(x_fp16 ? 1 : 0),
-                        static_cast<cl_int>(sc_fp16 ? 1 : 0),
-                        static_cast<cl_int>(zeros.buffer != nullptr ? 1 : 0),
-                        static_cast<cl_int>(bias.buffer != nullptr ? 1 : 0));
+                        x_half, scales_half, has_zeros, has_bias);
 }
 
 void argmax_argmin(cl_mem out_indices, cl_mem out_values, cl_mem input,
@@ -3009,6 +3065,11 @@ DeviceProperties device_properties() {
         return result;
     };
     DeviceProperties result{};
+    result.subgroup_sizes = device().subgroup_sizes;
+    result.fp16 = device().fp16;
+    result.subgroup_kernels = device().mixed_width_subgroups;
+    result.packed_signed_dot = device().packed_signed_dot;
+    result.optional_features_masked = device().optional_features_masked;
     read(CL_DEVICE_GLOBAL_MEM_SIZE, result.total_memory);
     read(CL_DEVICE_MAX_MEM_ALLOC_SIZE, result.max_allocation);
     read(CL_DEVICE_DOUBLE_FP_CONFIG, result.double_fp_config);

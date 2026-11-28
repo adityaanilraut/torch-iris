@@ -136,6 +136,71 @@ __kernel void scaled_difference_tensor(
 }
 )CLC",
 R"CLC(
+// Preserve ATen's complex division and signed-zero behavior for sgn.
+#pragma OPENCL FP_CONTRACT OFF
+inline float2 divide_complex(float2 a, float2 b) {
+    if (fabs(b.x) >= fabs(b.y)) {
+        if (b.x == 0.0f && b.y == 0.0f) return a / fabs(b);
+        const float ratio = b.y / b.x;
+        const float scale = 1.0f / (b.x + b.y * ratio);
+        return (float2)(a.x + a.y * ratio, a.y - a.x * ratio) * scale;
+    }
+    const float ratio = b.x / b.y;
+    const float scale = 1.0f / (b.y + b.x * ratio);
+    return (float2)(a.x * ratio + a.y, a.y * ratio - a.x) * scale;
+}
+
+__kernel void complex_unary(__global uchar* output, __global const float2* input,
+                            ulong input_offset, uint operation) {
+    enum { ABS, SGN, NEG, IS_NAN, IS_FINITE, IS_INF };
+    const ulong i = get_global_id(0);
+    const float2 z = input[input_offset + i];
+    switch (operation) {
+        case ABS:
+            ((__global float*)output)[i] = hypot(z.x, z.y);
+            break;
+        case SGN: {
+            float2 result = (float2)(0.0f);
+            if (z.x != 0.0f || z.y != 0.0f) {
+                result = divide_complex(z, (float2)(hypot(z.x, z.y), 0.0f));
+            }
+            ((__global float2*)output)[i] = result;
+            break;
+        }
+        case NEG:
+            ((__global float2*)output)[i] = -z;
+            break;
+        case IS_NAN:
+            output[i] = isnan(z.x) || isnan(z.y);
+            break;
+        case IS_FINITE:
+            output[i] = isfinite(z.x) && isfinite(z.y);
+            break;
+        case IS_INF:
+            output[i] = isinf(z.x) || isinf(z.y);
+            break;
+    }
+}
+
+__kernel void complex_division(
+    __global const ulong* geometry, __global float2* output,
+    __global const float2* left, __global const float2* right,
+    ulong left_offset, ulong right_offset, ulong rank
+) {
+    const ulong i = get_global_id(0);
+    ulong logical = i;
+    ulong a = left_offset, b = right_offset;
+    for (ulong d = rank; d > 0; --d) {
+        const __global ulong* axis = geometry + (d - 1) * 4;
+        const ulong index = logical % axis[0];
+        logical /= axis[0];
+        a += index * axis[2];
+        b += index * axis[3];
+    }
+    output[i] = divide_complex(left[a], right[b]);
+}
+#pragma OPENCL FP_CONTRACT ON
+
 inline float read_float(__global const float* source, ulong i, bool fp16) {
     return fp16 ? vload_half(i, (__global const half*)source) : source[i];
 }
@@ -2587,6 +2652,34 @@ __kernel void matmul_gemv_sg16_nn(GEMM_ARGUMENTS, uint fp16) {
 #endif
 )CLC",
 R"CLC(
+__kernel void linear_quant_portable(
+    __global float* output, __global const float* x, __global const uchar* weight,
+    __global const float* scales, __global const float* zeros, __global const float* bias,
+    ulong x_offset, ulong w_offset, ulong scale_offset, ulong zero_offset, ulong bias_offset,
+    int n, int k, int group_size, int num_groups, int x_fp16, int scales_fp16,
+    int has_zeros, int has_bias, int int4
+) {
+    const ulong col = get_global_id(0);
+    const ulong row = get_global_id(1);
+    const ulong qrow = w_offset + col * (int4 ? k / 2 : k);
+    float value = 0.0f;
+    for (int group = 0; group < num_groups; ++group) {
+        const ulong group_index = col * num_groups + group;
+        const float scale = read_float(scales, scale_offset + group_index, scales_fp16);
+        const float zero = has_zeros ? read_float(zeros, zero_offset + group_index, scales_fp16)
+                                     : (int4 ? 8.0f : 128.0f);
+        const int end = (group + 1) * group_size;
+        for (int i = group * group_size; i < end; ++i) {
+            const uchar q = int4 ? ((weight[qrow + i / 2] >> (4 * (i % 2))) & 15)
+                                 : weight[qrow + i];
+            const float input = read_float(x, x_offset + row * k + i, x_fp16);
+            value = fma(input, (q - zero) * scale, value);
+        }
+    }
+    if (has_bias) value += read_float(bias, bias_offset + col, x_fp16);
+    write_float(output, row * n + col, value, x_fp16);
+}
+
 #if defined(IRIS_HAS_SUBGROUPS) && defined(IRIS_HAS_REQD_SG8)
 // Weight-only INT8 group-wise dequant-in-registers subgroup GEMV/GEMM (qweight: [N, K] uint8)
 __attribute__((intel_reqd_sub_group_size(16)))

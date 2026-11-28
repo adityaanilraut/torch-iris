@@ -12,6 +12,7 @@ import sys
 
 import torch
 
+from .capabilities import iris_case_blocker
 from .operators import OPERATOR_SCOPE, run_operator_case
 from .training import TRAINING_SCOPE, run_training_case
 from .workloads import SCOPE, compare, run_case
@@ -24,7 +25,7 @@ def digest(path):
 
 def scope_digest(scope):
     root = Path(__file__).parent
-    files = ["scope-v1.json", "workloads.py"]
+    files = ["scope-v1.json", "workloads.py", "capabilities.py"]
     if scope is TRAINING_SCOPE:
         files.extend(["scope-training-v1.json", "training.py"])
     elif scope is OPERATOR_SCOPE:
@@ -113,8 +114,15 @@ def run_iris(output, reference_path, wheel, scope, execute):
     if not torch_iris.is_available():
         raise RuntimeError("A physical Intel Iris Xe OpenCL GPU is required")
     extension = Path(torch_iris._C.__file__).resolve()
+    package = Path(torch_iris.__file__).resolve().parent
+    properties = vars(torch_iris.get_device_properties())
     iris = torch_metadata() | {
         "gpu": torch_iris.device_name(),
+        "device_properties": properties,
+        "verification_mode": "feature_masked" if properties["optional_features_masked"] else "physical_driver",
+        "package_version": torch_iris.__version__,
+        "package_path": str(package),
+        "cpu_fallback_enabled": torch_iris.is_cpu_fallback_enabled(),
         "windows_display_adapters": adapters(),
         "extension_path": str(extension),
         "extension_sha256": digest(extension),
@@ -122,9 +130,14 @@ def run_iris(output, reference_path, wheel, scope, execute):
     if wheel:
         from zipfile import ZipFile
         with ZipFile(wheel) as archive:
-            wheel_extension = sha256(archive.read(f"torch_iris/{extension.name}")).hexdigest()
-        if wheel_extension != iris["extension_sha256"]:
-            raise RuntimeError("The loaded extension does not match the requested wheel")
+            wheel_files = {name for name in archive.namelist() if name.startswith("torch_iris/")
+                           and name.endswith((".py", ".pyd"))}
+            installed = [extension, *package.glob("*.py")]
+            if wheel_files != {f"torch_iris/{path.name}" for path in installed}:
+                raise RuntimeError("The installed package files do not match the requested wheel")
+            for path in installed:
+                if sha256(archive.read(f"torch_iris/{path.name}")).hexdigest() != digest(path):
+                    raise RuntimeError(f"The installed {path.name} does not match the requested wheel")
         iris.update({"wheel": str(wheel), "wheel_sha256": digest(wheel)})
 
     reference = None
@@ -142,13 +155,18 @@ def run_iris(output, reference_path, wheel, scope, execute):
     results = []
     for case in scope["cases"]:
         case_id = case["id"]
-        row = case | {"cpu_status": "untested", "iris_status": "untested", "cuda_status": cuda_status}
+        row = case | {"cpu_status": "untested", "iris_status": "untested", "cuda_status": cuda_status,
+                      "iris_cpu_fallbacks": {}}
         try:
             expected = execute(case, "cpu")
             row["cpu_status"] = "pass"
         except Exception as exc:
             row.update(cpu_status="fail", cpu_error=str(exc))
-        if row["cpu_status"] == "pass":
+        blocker = iris_case_blocker(case)
+        if blocker:
+            row.update(iris_status="hardware_blocked", iris_reason=blocker)
+        elif row["cpu_status"] == "pass":
+            previous = Counter(torch_iris.fallback_stats())
             try:
                 kernels = torch_iris._C._kernel_submissions()
                 actual = execute(case, "iris:0")
@@ -157,11 +175,17 @@ def run_iris(output, reference_path, wheel, scope, execute):
                 if case_id in {"mlp_forward_2d", "mlp_forward_3d"} and kernels < 4:
                     raise AssertionError("Expected native Iris kernel submissions for the complete MLP")
                 row["iris_kernel_submissions"] = kernels
-                row["iris_status"] = (
-                    "emulated_pass" if case.get("iris_implementation") == "emulated" else "native_pass"
-                )
+                implementation = case.get("iris_implementation", "native")
+                if not properties["subgroup_kernels"]:
+                    implementation = case.get("iris_implementation_without_subgroups", implementation)
+                row["iris_implementation_used"] = implementation
+                row["iris_status"] = f"{implementation}_pass"
             except Exception as exc:
                 row.update(iris_status="fail", iris_error=str(exc))
+            fallbacks = Counter(torch_iris.fallback_stats()) - previous
+            row["iris_cpu_fallbacks"] = dict(fallbacks)
+            if fallbacks and row["iris_status"].endswith("_pass"):
+                row["iris_status"] = "fallback_pass"
         if reference is not None:
             cuda_result = reference["results"][case_id]
             if cuda_result["status"] == "fail":
@@ -183,7 +207,7 @@ def run_iris(output, reference_path, wheel, scope, execute):
     cuda_counts = Counter(row["cuda_status"] for row in results)
     count = len(results)
     verified = cuda_counts["verified_pass"]
-    functional = iris_counts["native_pass"] + iris_counts["emulated_pass"]
+    functional = iris_counts["native_pass"] + iris_counts["emulated_pass"] + iris_counts["fallback_pass"]
     report = {
         "format_version": 1,
         "scope": scope["scope"],

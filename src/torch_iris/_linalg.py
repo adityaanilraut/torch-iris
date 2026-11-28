@@ -106,10 +106,10 @@ def _lu_solve(LU, pivots, B, *, left=True, adjoint=False):
 
 
 def _solve(A, B, *, left=True, check_errors=False):
-    vector = B.ndim == 1
+    _check_matrix(A, square=True)
+    vector = B.ndim == 1 or B.shape == A.shape[:-1]
     if vector and not left:
         raise RuntimeError("right solve expects a matrix RHS")
-    _check_matrix(A, square=True)
     lu, pivots, info = _lu_factor(A)
     if check_errors:
         torch.ops.aten._linalg_check_errors(info, "torch.linalg.solve_ex", is_matrix=A.ndim == 2)
@@ -120,7 +120,7 @@ def _solve(A, B, *, left=True, check_errors=False):
 def _inverse(A, *, check_errors=False):
     _check_matrix(A, square=True)
     identity = torch.eye(A.size(-1), device=A.device, dtype=A.dtype)
-    inverse, _, _, info = _solve(A, identity, check_errors=check_errors)
+    inverse, _, _, info = _solve(A, identity.expand(A.shape), check_errors=check_errors)
     return inverse, info
 
 

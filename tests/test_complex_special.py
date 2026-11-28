@@ -79,7 +79,8 @@ def test_conj_physical_and_backward():
     assert_values(gradient(device), gradient(host))
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.int64])
+@pytest.mark.parametrize("dtype", [pytest.param(torch.float16, marks=pytest.mark.requires_fp16),
+                                  torch.bfloat16, torch.int64])
 def test_negative_views_resolve_and_cast(dtype):
     expected = torch._neg_view(torch.arange(12).to(dtype).view(3, 4).T[1:])
     actual = torch._neg_view(torch.arange(12).to(dtype).to("iris").view(3, 4).T[1:])
@@ -134,7 +135,8 @@ def test_fft_multidimensional_out_and_backward(length):
 
 @pytest.mark.parametrize("order", [0, 1])
 @pytest.mark.parametrize("dtype", [torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32,
-                                  torch.int64, torch.float16, torch.bfloat16, torch.float32])
+                                  torch.int64, pytest.param(torch.float16, marks=pytest.mark.requires_fp16),
+                                  torch.bfloat16, torch.float32])
 def test_polygamma_promotion_and_out(order, dtype):
     values = [[1, 2, 3], [4, 5, 0]]
     if dtype.is_floating_point:
@@ -143,7 +145,8 @@ def test_polygamma_promotion_and_out(order, dtype):
     iris = x.to("iris")
     expected = torch.special.polygamma(order, x)
     assert_values(torch.special.polygamma(order, iris), expected, equal_nan=True)
-    for out_dtype in (torch.float32, torch.float16, torch.bfloat16, torch.complex64):
+    out_types = [torch.float32, torch.bfloat16, torch.complex64, *torch_iris.get_amp_supported_dtype()]
+    for out_dtype in out_types:
         target = torch.empty((2, 3), dtype=out_dtype).T
         actual = torch.empty((2, 3), dtype=out_dtype, device="iris").T
         expected_out = torch.polygamma(order, x, out=target)

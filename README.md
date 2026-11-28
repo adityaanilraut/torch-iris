@@ -1,10 +1,6 @@
 # torch-iris
 
-**An OpenCL backend extension for PyTorch that enables Intel Iris Xe GPU acceleration on 64-bit Windows.**
-
-`torch-iris` plugs into PyTorch's `PrivateUse1` backend slot and registers an `iris:0` device (along with `torch.iris` utilities). It is a **PyTorch extension**, not a standalone replacement for PyTorch—you install standard CPU PyTorch (`2.12.1`), add `torch-iris`, import both, and run standard PyTorch models and training loops on `torch.device("iris:0")`.
-
----
+`torch-iris` is an OpenCL backend for PyTorch on Intel Iris Xe graphics. Import it to register `iris:0` and the `torch.iris` device APIs.
 
 ## Requirements
 
@@ -15,51 +11,30 @@
 
 > **Note:** `torch-iris` claims PyTorch's `PrivateUse1` backend slot. It cannot be loaded in the same Python process as `torch-directml` (which also uses `PrivateUse1` and targets an older PyTorch version).
 
----
-
 ## Installation
 
-### Option 1: Install from PyPI (Recommended)
-
-On **64-bit Windows with Python 3.12**, install directly via `pip` (this automatically installs `torch==2.12.1` alongside `torch-iris`):
-
-```powershell
-py -3.12 -m venv .venv-iris
-.\.venv-iris\Scripts\python.exe -m pip install torch-iris
-```
-
-### Option 2: Install the prebuilt wheel from GitHub Releases
-
-Download `torch_iris-0.17.0-cp312-cp312-win_amd64.whl` from [GitHub Releases](https://github.com/adityaanilraut/torch-iris/releases/tag/v0.17.0) and install it with the CPU build of PyTorch.
+Install the CPU build of PyTorch first, then install `torch-iris` from PyPI.
 
 ```powershell
 py -3.12 -m venv .venv-iris
 $iris = '.\.venv-iris\Scripts\python.exe'
-
-# 1. Install CPU PyTorch 2.12.1
 & $iris -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
-
-# 2. Install the torch-iris extension wheel
-& $iris -m pip install --no-deps .\torch_iris-0.17.0-cp312-cp312-win_amd64.whl
+& $iris -m pip install torch-iris
 ```
 
-### Option 3: Build from source
+You can also download a Windows x64 wheel from [GitHub Releases](https://github.com/adityaanilraut/torch-iris/releases) and pass its path to `pip install --no-deps`.
+
+### Build from source
 
 Requires **Visual Studio 2022 Build Tools** with the **Desktop development with C++** workload and a **Windows 10/11 SDK**. The repository bundles the Khronos OpenCL C headers (`third_party/opencl`) and loads the OpenCL runtime dynamically from your installed Intel graphics driver.
 
-Run from an **x64 Native Tools Command Prompt for VS 2022** (or a shell with MSVC + Windows SDK configured):
+With the environment above and the x64 MSVC toolchain loaded, build from the repository root.
 
 ```powershell
-py -3.12 -m venv .venv-iris
-$iris = '.\.venv-iris\Scripts\python.exe'
-
-& $iris -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
 & $iris -m pip install setuptools wheel
 & $iris -m pip wheel --no-build-isolation --no-deps --wheel-dir dist .
-& $iris -m pip install --force-reinstall --no-deps dist\torch_iris-0.17.0-cp312-cp312-win_amd64.whl
+& $iris -m pip install --force-reinstall --no-deps dist\torch_iris-0.18.0-cp312-cp312-win_amd64.whl
 ```
-
----
 
 ## Quick Start
 
@@ -97,7 +72,7 @@ For a complete end-to-end CNN training script on MNIST (with `AdamW(fused=True)`
 & $iris examples\mnist_iris.py
 ```
 
----
+The example saves the latest training state to `last_model.pth` and keeps `best_model.pth` for inference. Pass `--resume last_model.pth --epochs 5` to continue through epoch five, and `--report mnist.json` to record per-epoch loss and accuracy, peak allocator memory, and CPU fallback counts. The resume checkpoint includes the CPU, Iris, and minibatch shuffle RNG states.
 
 ## Key Features & Device APIs
 
@@ -110,6 +85,8 @@ Once imported, `torch_iris` registers `torch.iris` as a PyTorch device module an
 - **Inference & async transfers:** Standard `model.eval()` and `torch.inference_mode()` work as expected. Pinned contiguous CPU tensors support asynchronous copies with `non_blocking=True` (call `torch_iris.synchronize()` before reading a CPU destination or measuring wall time).
 
 ### Mixed Precision (FP16 AMP)
+
+Check `torch.float16 in torch_iris.get_amp_supported_dtype()` before enabling FP16 autocast. BF16 rounding, unary math, and selected matrix products use FP32 arithmetic on the GPU. `get_device_properties()` reports the driver's subgroup widths, the enabled subgroup kernel and FP16 capabilities, packed signed INT8 dot-product acceleration, and the per-buffer allocation limit in bytes.
 
 Use PyTorch's autocast context with **`torch_iris.GradScaler()`**:
 
@@ -151,13 +128,10 @@ capsule = torch_iris.to_dlpack(tensor)
 restored = torch_iris.from_dlpack(capsule)
 ```
 
----
-
 ## Reliability & CPU Fallback
 
-Starting in **`0.16.1`**, `torch-iris` registers an observable `PrivateUse1` boxed **CPU fallback** for ATen operators that do not have a native OpenCL implementation, so everyday PyTorch workloads continue to run instead of aborting with `NotImplementedError`:
+The backend can run unimplemented ATen operators on CPU and records each fallback call.
 
-- **Native kernels always take precedence:** All native OpenCL kernels and PyTorch `CompositeExplicitAutograd` decompositions run directly on Intel Iris Xe without touching CPU.
 - **Once-per-operator warning:** The first time an unimplemented operator falls back to CPU, `torch-iris` emits a `UserWarning` naming the operator so host/device transfers are never hidden. Set `TORCH_IRIS_FALLBACK_WARN=0` (or call `torch_iris.set_fallback_warning_enabled(False)`) to silence warnings.
 - **Inspect fallback usage:** Call `torch_iris.fallback_stats()` to see a `{op_name: count}` dictionary of every operator that fell back to CPU, and `torch_iris.reset_fallback_stats()` to clear counters:
 
@@ -168,21 +142,16 @@ print(torch_iris.fallback_stats())  # {} when 100% native on Iris Xe
 ```
 
 - **Strict GPU-only mode:** Disable CPU fallback via the environment variable `TORCH_IRIS_CPU_FALLBACK=0` or at runtime with `torch_iris.set_cpu_fallback_enabled(False)` (check with `torch_iris.is_cpu_fallback_enabled()`). In strict mode, unimplemented operators raise `NotImplementedError` immediately.
-- **FP64 remains explicit:** Intel Iris Xe OpenCL lacks `float64` storage, so `float64` / `complex128` allocations on `iris:0` still fail explicitly rather than being silently downcast.
 - **Defensive OpenCL memory handling:** Allocations exceeding `max_mem_alloc_size` raise a clear `torch.OutOfMemoryError`, and out-of-memory allocations automatically flush and reclaim cached device buffers before failing.
-
----
 
 ## Known Limitations & Performance Notes
 
-- **No FP64 (`float64`) storage:** Intel Iris Xe OpenCL drivers do not expose `cl_khr_fp64`. Operations requiring `float64` storage are intentionally unsupported rather than silently downcast.
+- **Storage limits.** `float64` and `complex128` allocations raise an error.
   - Use `torch_iris.GradScaler()` instead of `torch.amp.GradScaler("iris")` (upstream PyTorch 2.12.1 casts the scale reciprocal to `float64`).
   - For legacy `torch.jit.trace` with Iris inputs, pass `check_trace=False` (PyTorch's built-in trace checker casts outputs to `float64`) and validate outputs separately.
 - **DLPack interop:** PyTorch 2.12.1's generic `torch.from_dlpack()` does not map the `iris` device type; use `torch_iris.to_dlpack()` and `torch_iris.from_dlpack()`.
 - **`mem_get_info()` unavailable:** Windows OpenCL drivers do not expose a reliable free-memory query. Use `torch_iris.get_device_properties()` for driver capacity/per-buffer limits and `torch_iris.memory_stats()` for bytes tracked by the `torch-iris` allocator.
 - **Performance guidance:** Large device-resident matrix multiplications and vision workloads benefit most from Iris Xe acceleration. Small tensors, recurrent layers, matrix factorizations, or transfer-heavy loops can be slower than CPU due to OpenCL launch and host/device copy overhead—always time the full step with `torch_iris.synchronize()`.
-
----
 
 ## Testing & Verification
 
@@ -196,31 +165,30 @@ Install `pytest` (and `torchvision` for vision tests) in your environment and ru
 & $iris -m pytest -p no:cacheprovider -q tests
 
 # Run standalone parity scopes against the built wheel
-$wheel = 'dist\torch_iris-0.17.0-cp312-cp312-win_amd64.whl'
+$wheel = 'dist\torch_iris-0.18.0-cp312-cp312-win_amd64.whl'
 foreach ($scope in 'forward', 'training', 'operators') {
     & $iris -m parity.run iris --scope $scope --wheel $wheel --output "parity-$scope.json"
+    if ($LASTEXITCODE -ne 0) { throw "Parity failed for $scope" }
 }
 ```
 
----
+The hosted Windows job builds, installs, and imports the wheel and publishes its SHA-256. Physical GPU verification runs separately. Parity reports count per-case CPU fallback calls and distinguish native kernels, on-device emulation, CPU fallback, blocked cases, and failures. If FP16 is unavailable, its cases are marked `hardware_blocked` and the scope exits incomplete. Set `$env:TORCH_IRIS_CPU_FALLBACK = '0'` for GPU-only verification. Set `$env:TORCH_IRIS_MASK_OPTIONAL_FEATURES = '1'` before starting a separate process to verify portable kernels with FP16, subgroup kernels, and packed INT8 acceleration disabled. Supply a CUDA reference only when captured on a physical NVIDIA GPU.
 
-## Project Structure
+Run `& $iris -m parity.benchmark --cpu-threads 4 --output benchmark.json` for synchronized FP32 measurements of matrix multiplication, MLP and CNN training steps, causal attention, and a matrix multiplication with input and output copies included.
 
-```text
-torch-iris/
-├── csrc/                  # C++20 / OpenCL backend, runtime, and kernel sources
-├── examples/              # End-to-end usage examples (e.g., MNIST CNN training)
-├── parity/                # CPU-reference parity runner and scope fixtures
-├── src/torch_iris/        # Python device registration, AMP, and op dispatchers
-├── tests/                 # Unit, capability, and parity tests
-├── third_party/opencl/    # Bundled Khronos OpenCL C headers + Apache-2.0 license
-├── LICENSE                # Apache License 2.0
-├── NOTICE                 # Copyright, third-party attributions, and trademark notices
-├── pyproject.toml         # Package metadata and build configuration
-└── setup.py               # PyTorch CppExtension build script
+| Workload | Exercised scope | Executable coverage |
+| --- | --- | --- |
+| MLP and matrix products | FP32 broadcast and strided inputs, empty dimensions, gradients, fused bias, `out=`; FP16 and BF16 products with FP32 output; signed INT8 to INT32 | [Forward parity](parity/scope-v1.json), [matrix tests](tests/test_reliability_fallback.py) |
+| CNN and optimization | FP32 grouped/dilated convolution, pooling, normalization, training and gradients; SGD, Adam and AdamW state and updates; FP16 autocast | [Training parity](parity/scope-training-v1.json), [MNIST checkpoint test](tests/test_mnist_checkpoint.py) |
+| Attention | FP32 causal and explicit masks, strided inputs, grouped-query attention, forward/backward and decoding; FP16 where available | [Operator parity](parity/scope-operators-v1.json), [attention tests](tests/test_iris.py) |
+| Typed pointwise and linalg | BF16 and complex64 unary values, predicates, gradients and applicable output variants; BF16 rounding and batched solve/inverse regressions | [Unary tests](tests/test_typed_unary.py), [linalg tests](tests/test_capability_fixes.py) |
+
+To generate the PyTorch operator inventory for developing new parity cases, install `expecttest` and run:
+
+```powershell
+& $iris -m pip install expecttest
+& $iris -m parity.inventory --output parity/inventory-v1.json
 ```
-
----
 
 ## License & Legal
 

@@ -1,12 +1,13 @@
 """Register Intel Iris Xe as a PyTorch device."""
 
-__version__ = "0.17.0"
-
 from contextlib import contextmanager
+from importlib.metadata import version as _distribution_version
 import sys
 from types import SimpleNamespace
 
 import torch
+
+__version__ = _distribution_version("torch-iris")
 
 if torch.__version__.split("+", 1)[0] != "2.12.1":
     raise ImportError(f"torch-iris requires PyTorch 2.12.1, found {torch.__version__}")

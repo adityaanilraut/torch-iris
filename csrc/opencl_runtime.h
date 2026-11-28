@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace iris {
 
@@ -32,12 +33,18 @@ enum class IntegerOperation : cl_uint {
     BitwiseAnd, BitwiseOr, BitwiseXor, BitwiseNot, Neg, Fmod, Remainder, Sign, Abs, Maximum, Minimum,
     DivideTrunc, DivideFloor
 };
+enum class ComplexUnary : cl_uint { Abs, Sgn, Neg, IsNan, IsFinite, IsInf, None };
 
 bool gpu_available() noexcept;
 bool has_fp16() noexcept;
 bool context_initialized() noexcept;
 const std::string& gpu_name();
 struct DeviceProperties {
+    std::vector<std::size_t> subgroup_sizes;
+    bool fp16;
+    bool subgroup_kernels;
+    bool packed_signed_dot;
+    bool optional_features_masked;
     cl_ulong total_memory;
     cl_ulong max_allocation;
     cl_device_fp_config double_fp_config;
@@ -72,6 +79,10 @@ void strided_elementwise(
     Elementwise op, cl_mem output, cl_mem left, cl_mem right, cl_ulong length,
     cl_ulong output_offset, cl_ulong left_offset, cl_ulong right_offset,
     std::span<const cl_ulong> geometry, float alpha, float beta, bool serial, bool fp16);
+void complex_unary(ComplexUnary op, cl_mem output, cl_mem input,
+                   cl_ulong length, cl_ulong input_offset);
+void complex_division(cl_mem output, cl_mem left, cl_mem right, cl_ulong length,
+                      cl_ulong left_offset, cl_ulong right_offset, std::span<const cl_ulong> geometry);
 void typed_copy(cl_mem output, cl_mem input, cl_ulong length, cl_ulong output_offset,
                 cl_ulong input_offset, std::span<const cl_ulong> geometry, ValueType output_type,
                 ValueType input_type, cl_ulong integer_fill, bool fill,

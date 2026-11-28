@@ -1,6 +1,7 @@
 """Tests for boxed CPU fallback, observability, ergonomics, and OpenCL hardening."""
 
 import copy
+import json
 import os
 import subprocess
 import sys
@@ -11,9 +12,11 @@ import torch
 import torch.nn.functional as F
 
 import torch_iris
+from parity.capabilities import iris_case_blocker
 from parity.operators import OPERATOR_SCOPE, run_operator_case
+from parity.run import run_iris
 from parity.training import TRAINING_SCOPE, run_training_case
-from parity.workloads import SCOPE, compare, run_case
+from parity.workloads import SCOPE, compare, run_case, snapshot
 
 
 pytestmark = pytest.mark.skipif(not torch_iris.is_available(), reason="requires Intel Iris Xe")
@@ -22,16 +25,20 @@ DEVICE = torch.device("iris:0")
 
 @pytest.fixture(autouse=True)
 def _reset_fallback_state():
-    torch_iris.set_cpu_fallback_enabled(True)
+    enabled = torch_iris.is_cpu_fallback_enabled()
+    warning = torch_iris.is_fallback_warning_enabled()
     torch_iris.set_fallback_warning_enabled(True)
     torch_iris.reset_fallback_stats()
-    yield
-    torch_iris.set_cpu_fallback_enabled(True)
-    torch_iris.set_fallback_warning_enabled(True)
-    torch_iris.reset_fallback_stats()
+    try:
+        yield
+    finally:
+        torch_iris.set_cpu_fallback_enabled(enabled)
+        torch_iris.set_fallback_warning_enabled(warning)
+        torch_iris.reset_fallback_stats()
 
 
 def test_unimplemented_op_cpu_fallback_stats_and_once_warning():
+    torch_iris.set_cpu_fallback_enabled(True)
     host = torch.tensor([-2.5, -0.5, 0.0, 1.25, 4.0], dtype=torch.float32)
     x = host.to(DEVICE)
 
@@ -67,6 +74,46 @@ def test_unimplemented_op_cpu_fallback_stats_and_once_warning():
         _ = torch.special.i0e(x)
     assert [w for w in silenced if "special_i0e" in str(w.message)] == []
     assert torch_iris.fallback_stats().get("aten::special_i0e.out") == 1
+
+
+def test_parity_report_counts_actual_fallbacks_per_case(tmp_path):
+    torch_iris.set_cpu_fallback_enabled(True)
+    scope = SCOPE | {"cases": [{"id": "fallback_1"}, {"id": "native"}, {"id": "fallback_2"}]}
+
+    def execute(case, device):
+        x = torch.tensor([.25, .5], device=device)
+        value = x + 1 if case["id"] == "native" else torch.special.i0e(x)
+        return snapshot(value=value)
+
+    output = tmp_path / "parity.json"
+    torch_iris.set_fallback_warning_enabled(False)
+    assert run_iris(output, None, None, scope, execute) == 0
+    report = json.loads(output.read_text())
+    cases = report["cases"]
+    assert [row["iris_status"] for row in cases] == ["fallback_pass", "native_pass", "fallback_pass"]
+    assert [row["iris_cpu_fallbacks"] for row in cases] == [
+        {"aten::special_i0e.out": 1}, {}, {"aten::special_i0e.out": 1},
+    ]
+    assert report["coverage"]["iris_native"]["passed"] == 1
+    assert report["coverage"]["iris_functional"]["passed"] == 3
+
+
+def test_parity_reports_missing_fp16_without_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(torch_iris, "get_amp_supported_dtype", lambda: [])
+    scope = SCOPE | {"cases": [{"id": name, "requires_fp16": True}
+                              for name in ("fp16_operators", "autocast_training")]}
+    devices = []
+
+    def execute(case, device):
+        devices.append(device)
+        return {}
+
+    output = tmp_path / "parity.json"
+    assert run_iris(output, None, None, scope, execute) == 1
+    assert devices == ["cpu", "cpu"]
+    report = json.loads(output.read_text())
+    assert report["coverage"]["iris_status_counts"] == {"hardware_blocked": 2}
+    assert report["coverage"]["iris_functional"] == {"passed": 0, "required": 2}
 
 
 def test_strict_gpu_only_mode_blocks_fallback():
@@ -120,6 +167,29 @@ def test_native_int8_matmul_checks_out_contract():
         torch._int_mm(a, b, out=torch.empty((2, 3), dtype=torch.int32, device=DEVICE).T)
 
 
+@pytest.mark.parametrize("group_size", [3, 8])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_weight_only_linear_group_boundaries_and_empty(group_size, with_bias):
+    torch_iris.set_cpu_fallback_enabled(False)
+    generator = torch.Generator().manual_seed(2026)
+    inner = 2 * group_size
+    x = torch.randn(2, 3, inner, generator=generator).transpose(0, 1)
+    weight = torch.randn(5, inner, generator=generator)
+    bias = torch.randn(5, generator=generator) if with_bias else None
+    for bits in ([8] if group_size == 3 else [4, 8]):
+        quantize = getattr(torch_iris.ops, f"quantize_weight_int{bits}")
+        linear = getattr(torch_iris.ops, f"linear_int{bits}")
+        packed, scales, zeros = quantize(weight, group_size=group_size, symmetric=False)
+        for rows, w, s, z in ((x, packed, scales, zeros), (x[..., :0], packed[:, :0], scales[:, :0], zeros[:, :0]),
+                              (x[:0], packed, scales, zeros)):
+            args = rows, w, s, z, bias
+            expected = linear(*args, group_size=group_size)
+            actual = linear(*(value.to(DEVICE) if value is not None else None for value in args),
+                            group_size=group_size)
+            torch.testing.assert_close(actual.cpu(), expected, rtol=2e-4, atol=2e-5)
+    assert torch_iris.fallback_stats() == {}
+
+
 def test_native_matrix_product_overloads():
     torch_iris.set_cpu_fallback_enabled(False)
     a = torch.arange(-6, 6, dtype=torch.float32).reshape(3, 4) / 4
@@ -152,7 +222,7 @@ def test_native_matrix_product_overloads():
     assert torch_iris.fallback_stats() == {}
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [pytest.param(torch.float16, marks=pytest.mark.requires_fp16), torch.bfloat16])
 def test_native_matrix_products_with_float32_output(dtype):
     torch_iris.set_cpu_fallback_enabled(False)
     a = torch.arange(-6, 6, dtype=dtype).reshape(3, 4) / 4
@@ -204,6 +274,7 @@ def test_env_var_controls_in_fresh_subprocess():
 
 
 def test_fallback_out_inplace_multi_output_strided_and_autograd():
+    torch_iris.set_cpu_fallback_enabled(True)
     torch_iris.set_fallback_warning_enabled(False)
 
     # 1. Multi-tensor output (torch.frexp returns (mantissa, exponent))
@@ -270,6 +341,7 @@ def test_fallback_out_inplace_multi_output_strided_and_autograd():
 
 
 def test_fp64_guard_remains_explicit_with_fallback():
+    torch_iris.set_cpu_fallback_enabled(True)
     props = torch_iris.get_device_properties()
     if props.double_fp_config == 0:
         with pytest.raises(RuntimeError, match="storage"):
@@ -393,31 +465,41 @@ def test_empty_and_zero_size_tensors_hardening():
 
 def test_oversized_allocation_and_cache_reclamation():
     props = torch_iris.get_device_properties()
+    if not props.max_allocation:
+        pytest.skip("OpenCL per-buffer allocation limit is unavailable")
+    torch_iris.empty_cache()
+    baseline = torch_iris.memory_allocated()
     oversized_elems = props.max_allocation // 4 + 1024
-    with pytest.raises((torch.OutOfMemoryError, RuntimeError), match="max_mem_alloc_size"):
+    with pytest.raises(torch.OutOfMemoryError, match="max_mem_alloc_size"):
         torch.empty((oversized_elems,), dtype=torch.float32, device=DEVICE)
 
     # Verify allocator remains healthy after failed allocation and empty_cache reclaims pooled buffers.
     torch_iris.empty_cache()
-    t = torch.ones((1024, 1024), dtype=torch.float32, device=DEVICE)
-    assert t.sum().item() == pytest.approx(1024.0 * 1024.0)
-    del t
+    torch_iris.reset_peak_memory_stats()
+    for _ in range(5):
+        t = torch.ones((1024, 1024), dtype=torch.float32, device=DEVICE)
+        assert t.sum().item() == pytest.approx(1024.0 * 1024.0)
+        del t
+        torch_iris.synchronize()
+        assert torch_iris.memory_allocated() == baseline
     stats_cached = torch_iris.memory_stats()
     assert stats_cached["cached_bytes"] >= 1024 * 1024 * 4
     assert "cache_reclaims" in stats_cached
     torch_iris.empty_cache()
-    assert torch_iris.memory_stats()["cached_bytes"] == 0
+    cleared = torch_iris.memory_stats()
+    assert cleared["cached_bytes"] == 0
+    assert cleared["reserved_bytes"] == cleared["allocated_bytes"] == baseline
+    print(json.dumps({"oversized_request_bytes": oversized_elems * 4, "baseline_bytes": baseline,
+                      "after_recovery": stats_cached, "after_empty_cache": cleared}))
 
 
 def test_parity_scopes_have_zero_cpu_fallbacks():
     torch_iris.reset_fallback_stats()
-    torch_iris.set_cpu_fallback_enabled(True)
+    torch_iris.set_cpu_fallback_enabled(False)
 
-    for case in SCOPE["cases"]:
-        compare(run_case(case, "iris:0"), run_case(case, "cpu"))
-    for case in TRAINING_SCOPE["cases"]:
-        compare(run_training_case(case, "iris:0"), run_training_case(case, "cpu"), TRAINING_SCOPE["tolerances"])
-    for case in OPERATOR_SCOPE["cases"]:
-        compare(run_operator_case(case, "iris:0"), run_operator_case(case, "cpu"), OPERATOR_SCOPE["tolerances"])
+    for scope, execute in ((SCOPE, run_case), (TRAINING_SCOPE, run_training_case), (OPERATOR_SCOPE, run_operator_case)):
+        for case in scope["cases"]:
+            if not iris_case_blocker(case):
+                compare(execute(case, "iris:0"), execute(case, "cpu"), scope["tolerances"])
 
     assert torch_iris.fallback_stats() == {}

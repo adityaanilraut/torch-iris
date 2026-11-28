@@ -2,11 +2,13 @@ import unittest
 
 import torch_iris
 
+from parity.capabilities import iris_case_blocker
 from parity.operators import OPERATOR_SCOPE, run_operator_case
 from parity.training import TRAINING_SCOPE, run_training_case
 from parity.workloads import SCOPE, compare, run_case
 
 
+@unittest.skipUnless(torch_iris.is_available(), "requires Intel Iris Xe")
 class IrisParityTests(unittest.TestCase):
     def test_mlp_forward_scope(self):
         for case in SCOPE["cases"]:
@@ -21,11 +23,15 @@ class IrisParityTests(unittest.TestCase):
     def test_mlp_training_scope(self):
         for case in TRAINING_SCOPE["cases"]:
             with self.subTest(case=case["id"]):
+                if blocker := iris_case_blocker(case):
+                    self.skipTest(blocker)
                 compare(run_training_case(case, "iris:0"), run_training_case(case, "cpu"),
                         TRAINING_SCOPE["tolerances"])
 
     def test_fp32_operator_scope(self):
         for case in OPERATOR_SCOPE["cases"]:
             with self.subTest(case=case["id"]):
+                if blocker := iris_case_blocker(case):
+                    self.skipTest(blocker)
                 compare(run_operator_case(case, "iris:0"), run_operator_case(case, "cpu"),
                         OPERATOR_SCOPE["tolerances"])
